@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Benefits Decision Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+    <h1>Benefits Decision Test</h1>
+
+    <div id="auth-section">
+        <h2>Login</h2>
+        <input type="email" id="email" placeholder="your-email@domain.com">
+        <input type="password" id="password" placeholder="password">
+        <button onclick="login()">Login</button>
+    </div>
+
+    <div id="test-section" style="display:none;">
+        <h2>Test Decision Map</h2>
+        <textarea id="scenario" rows="4" cols="50">Single adult, 58 years old. Works part-time at a grocery store, about 25 hours a week. Makes around $1,700 a month before taxes. Pays electric and gas separately, about $180 total. Rent is $950. No kids. No disability. Hasn't applied for LIHEAP yet. Lost SNAP last year because they said they made too much.</textarea>
+        <br><br>
+        <button onclick="runTest()">Run Decision Map</button>
+        <div id="results"></div>
+    </div>
+
+    <script>
+        const supabaseUrl = 'https://wsqapbhaifqlsgnpgdhv.supabase.co'
+        const supabaseKey = 'sb_secret_QvGHfiZoZ1JXFPxQRbZs5Q_fQXmiCMJ'
+        const apiUrl = 'https://benefits-decision-api.onrender.com'
+
+        const supabase = supabase.createClient(supabaseUrl, supabaseKey)
+
+        let orgId = 'b86a3947-0f61-4e7c-b0e0-cc7bdbd7f552' // your test org
+
+        async function login() {
+            const email = document.getElementById('email').value
+            const password = document.getElementById('password').value
+
+            const { data, error } = await supabase.auth.signInWithPassword({
+                email: email,
+                password: password
+            })
+
+            if (error) {
+                alert('Login failed: ' + error.message)
+            } else {
+                document.getElementById('auth-section').style.display = 'none'
+                document.getElementById('test-section').style.display = 'block'
+                alert('Login successful!')
+            }
+        }
+
+        async function runTest() {
+            const session = await supabase.auth.getSession()
+            if (!session.data.session) {
+                alert('Not logged in')
+                return
+            }
+
+            const token = session.data.session.access_token
+            const scenario = document.getElementById('scenario').value
+
+            try {
+                const response = await fetch(`${apiUrl}/runs`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: JSON.stringify({
+                        org_id: orgId,
+                        input_raw: scenario
+                    })
+                })
+
+                const result = await response.json()
+                document.getElementById('results').innerHTML =
+                    '<h3>Decision Map Result:</h3><pre>' + JSON.stringify(result, null, 2) + '</pre>'
+
+            } catch (error) {
+                document.getElementById('results').innerHTML =
+                    '<h3>Error:</h3>' + error.message
+            }
+        }
+    </script>
+</body>
+</html>
