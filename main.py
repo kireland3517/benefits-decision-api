@@ -123,7 +123,7 @@ def normalize_facts(input_raw: str) -> dict:
     input_lower = input_raw.lower()
 
     # Extract income - handle various formats
-    income_match = re.search(r'\$?([0-9,]+)', input_raw.replace("$", "").replace(",", ""))
+    income_match = re.search(r'\$?([0-9,]+)', input_raw)
     if income_match:
         try:
             income_str = income_match.group(1).replace(",", "")
