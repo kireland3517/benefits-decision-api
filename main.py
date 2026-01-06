@@ -168,7 +168,16 @@ def generate_decision_map(facts: dict) -> dict:
         "confidence": "medium"
     }
 
-    gross_income = facts.get("gross_monthly_income", 0)
+    gross_income = facts.get("gross_monthly_income")
+
+    if gross_income is None:
+        decision_map["current_status"] = "insufficient_info"
+        decision_map["reason"] = "Unable to determine income from provided information"
+        decision_map["next_steps"] = [
+            "Verify monthly gross income amount",
+            "Gather recent pay stubs or income documentation"
+        ]
+        return decision_map
 
     if gross_income <= SNAP_GROSS_LIMIT_1_PERSON:
         decision_map["current_status"] = "likely_eligible"
