@@ -8,6 +8,7 @@ import httpx
 from datetime import datetime
 import json
 import uuid
+import re
 
 app = FastAPI(title="Benefits Decision Scaffold API")
 
@@ -121,9 +122,14 @@ def normalize_facts(input_raw: str) -> dict:
     # Basic pattern matching
     input_lower = input_raw.lower()
 
-    # Extract income
-    if "1700" in input_raw or "1,700" in input_raw:
-        facts["gross_monthly_income"] = 1700
+    # Extract income - handle various formats
+    income_match = re.search(r'\$?([0-9,]+)', input_raw.replace("$", "").replace(",", ""))
+    if income_match:
+        try:
+            income_str = income_match.group(1).replace(",", "")
+            facts["gross_monthly_income"] = int(income_str)
+        except (ValueError, AttributeError):
+            pass
 
     # Extract age
     if "58" in input_raw:
