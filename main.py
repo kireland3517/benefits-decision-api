@@ -38,14 +38,14 @@ class RunResponse(BaseModel):
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify Supabase JWT and extract user ID"""
     try:
-        # In production, verify with Supabase JWT secret
-        # For now, we'll extract user_id from unverified token
         token = credentials.credentials
-
-        # Simple decode without verification for MVP
-        # TODO: Add proper JWT verification in production
         payload = jwt.decode(token, options={"verify_signature": False})
         user_id = payload.get("sub")
+
+        # DEBUG: Print what we're extracting
+        print(f"DEBUG - JWT payload: {payload}")
+        print(f"DEBUG - Extracted user_id: {user_id}")
+        print(f"DEBUG - Expected user_id: 47405c01-9f36-48e8-8482-c65a6ce020b9")
 
         if not user_id:
             raise HTTPException(
