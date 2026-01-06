@@ -27,7 +27,7 @@
         const supabaseKey = 'sb_secret_QvGHfiZoZ1JXFPxQRbZs5Q_fQXmiCMJ'
         const apiUrl = 'https://benefits-decision-api.onrender.com'
 
-        const supabase = supabase.createClient(supabaseUrl, supabaseKey)
+        const supabaseClient = supabase.createClient(supabaseUrl, supabaseKey)
 
         let orgId = 'b86a3947-0f61-4e7c-b0e0-cc7bdbd7f552' // your test org
 
@@ -35,7 +35,7 @@
             const email = document.getElementById('email').value
             const password = document.getElementById('password').value
 
-            const { data, error } = await supabase.auth.signInWithPassword({
+            const { data, error } = await supabaseClient.auth.signInWithPassword({
                 email: email,
                 password: password
             })
@@ -50,7 +50,7 @@
         }
 
         async function runTest() {
-            const session = await supabase.auth.getSession()
+            const session = await supabaseClient.auth.getSession()
             if (!session.data.session) {
                 alert('Not logged in')
                 return
