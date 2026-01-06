@@ -68,6 +68,10 @@ async def verify_org_membership(user_id: str, org_id: str):
             "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         }
 
+        # DEBUG: Print what we're checking
+        print(f"DEBUG - Checking membership for user_id: {user_id}")
+        print(f"DEBUG - Checking membership for org_id: {org_id}")
+
         response = await client.get(
             f"{SUPABASE_URL}/rest/v1/org_members",
             headers=headers,
@@ -78,6 +82,9 @@ async def verify_org_membership(user_id: str, org_id: str):
             }
         )
 
+        print(f"DEBUG - Response status: {response.status_code}")
+        print(f"DEBUG - Response body: {response.text}")
+
         if response.status_code != 200:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -85,6 +92,8 @@ async def verify_org_membership(user_id: str, org_id: str):
             )
 
         members = response.json()
+        print(f"DEBUG - Found members: {members}")
+
         if not members:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
