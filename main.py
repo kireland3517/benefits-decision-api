@@ -494,7 +494,9 @@ def normalize_facts(input_raw: str) -> dict:
                 facts["household_members"].append({"type": "children", "count": 2, "note": "twins"})
             elif pattern_type == 'children':
                 num_children = int(match.group(1))
-                facts["household_size"] = max(facts["household_size"], num_children + 1)
+                # Add children to existing adults (couple=2, single=1, or current size)
+                base_adults = max(1, facts["household_size"])
+                facts["household_size"] = base_adults + num_children
                 facts["household_members"].append({"type": "children", "count": num_children})
             elif pattern_type == 'children_ages':
                 # "children ages 6 and 10" = 2 children, add to current adults
@@ -919,7 +921,7 @@ def normalize_facts(input_raw: str) -> dict:
         (r'(\d+)\s*years?\s*old', 'age'),
         (r'age[sd]?\s*(\d+)', 'age'),
         (r'(?:kids?|children?)\s*(?:are\s*)?(\d+)(?:\s*,\s*(\d+))?(?:\s*(?:,|and)\s*(\d+))?', 'child_ages'),
-        (r'(?:kids?|children?)\s*ages?\s*(\d+)\s*and\s*(\d+)', 'child_ages_named'),  # "children ages 3 and 6"
+        (r'(?:kids?|children?)\s*(?:\w+\s+)?ages?\s*(\d+)\s*and\s*(\d+)', 'child_ages_named'),  # "two children ages 3 and 6"
         (r'elderly|senior', 'elderly'),
         (r'retired', 'retired'),
         # Child-specific patterns
