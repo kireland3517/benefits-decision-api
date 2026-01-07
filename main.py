@@ -124,20 +124,31 @@ def normalize_facts(input_raw: str) -> dict:
 
     # Extract income - handle various formats
     print(f"DEBUG - Raw input: {input_raw}")
-    income_match = re.search(r'\$?([0-9,]+)', input_raw)
-    print(f"DEBUG - Income regex match: {income_match}")
-    if income_match:
-        print(f"DEBUG - Matched text: {income_match.group(0)}")
-        print(f"DEBUG - Captured group: {income_match.group(1)}")
-        try:
-            income_str = income_match.group(1).replace(",", "")
-            facts["gross_monthly_income"] = int(income_str)
-            print(f"DEBUG - Final income: {facts['gross_monthly_income']}")
-        except (ValueError, AttributeError):
-            print("DEBUG - Failed to convert income to int")
-            pass
+
+    # Look for money patterns more specifically
+    income_patterns = [
+        r'\$([0-9,]+)',  # $4,500
+        r'making.*?([0-9,]+).*?month',  # making 4,500 per month
+        r'([0-9,]+).*?per month',  # 4,500 per month
+        r'([0-9,]+).*?monthly'  # 4,500 monthly
+    ]
+
+    income_found = None
+    for pattern in income_patterns:
+        match = re.search(pattern, input_raw, re.IGNORECASE)
+        if match:
+            try:
+                income_str = match.group(1).replace(",", "")
+                income_found = int(income_str)
+                print(f"DEBUG - Found income {income_found} with pattern: {pattern}")
+                break
+            except (ValueError, IndexError):
+                continue
+
+    if income_found:
+        facts["gross_monthly_income"] = income_found
     else:
-        print("DEBUG - No income found in text")
+        print("DEBUG - No income pattern matched")
 
     # Extract age
     if "58" in input_raw:
