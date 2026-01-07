@@ -504,11 +504,15 @@ def normalize_facts(input_raw: str) -> dict:
 
     income_patterns = [
         # SPECIFIC BENEFIT TYPES FIRST (before generic patterns)
-        # Government benefits (always monthly) - label before and after amount
+        # Government benefits (always monthly) - Social Security patterns
         (r'(?:combined\s*)?social\s*security\s*(?:income\s*)?(?:of\s*)?\$([0-9,.]+)', 'social_security', 'monthly'),
         (r'social\s*security\s*(?:income\s*)?(?:of\s*)?\$([0-9,.]+)', 'social_security', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?social\s*security', 'social_security', 'monthly'),
         (r'\$([0-9,.]+)/month\s*(?:from\s*)?social\s*security', 'social_security', 'monthly'),
+        # Multiple person Social Security patterns (husband/wife/spouse receives)
+        (r'(?:husband|wife|spouse)\s*(?:receives?|gets?)\s*\$([0-9,.]+)\s*/?\s*(?:month\s*)?(?:from\s*)?social\s*security', 'social_security', 'monthly'),
+        (r'(?:receives?|gets?)\s*\$([0-9,.]+)\s*/?\s*(?:month\s*)?social\s*security', 'social_security', 'monthly'),
+        (r'(?:receives?|gets?)\s*\$([0-9,.]+)\s*/?\s*(?:month\s*)?(?:from\s*)?(?:social\s*security|ss\b)', 'social_security', 'monthly'),
         (r'unemployment\s*(?:benefits?\s*)?(?:of\s*)?\$([0-9,.]+)', 'unemployment', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?unemployment', 'unemployment', 'monthly'),
         (r'expecting\s*(?:about\s*)?\$([0-9,.]+)\s*(?:weekly|per\s*week)', 'unemployment_pending', 'weekly'),
@@ -525,8 +529,11 @@ def normalize_facts(input_raw: str) -> dict:
 
         # Support payments
         (r'(?:receives?\s*)?\$([0-9,.]+)\s*(?:monthly\s*)?child\s*support', 'child_support', 'monthly'),
+        (r'(?:receives?\s*)\$([0-9,.]+)\s*/?\s*month\s*(?:in\s*)?child\s*support', 'child_support', 'monthly'),  # "Receives $350/month child support"
+        (r'(?:receives?\s*)\$([0-9,.]+)\s*(?:in\s*)?child\s*support', 'child_support', 'monthly'),  # "Receives $350 child support"
         (r'child\s*support\s*(?:of\s*)?\$([0-9,.]+)', 'child_support', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:from\s*)?child\s*support', 'child_support', 'monthly'),
+        (r'\$([0-9,.]+)\s*/?\s*month\s*(?:in\s*)?child\s*support', 'child_support', 'monthly'),  # "$350/month child support"
         (r'alimony\s*(?:of\s*)?\$([0-9,.]+)', 'alimony', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:from\s*)?alimony', 'alimony', 'monthly'),
 
@@ -571,7 +578,30 @@ def normalize_facts(input_raw: str) -> dict:
     seen_amounts = {}  # Track amounts with their types for deduplication
     seen_monthly_amounts = set()  # Track normalized monthly amounts to prevent double-counting
 
-    # Pre-pass: detect work hours mentioned (for hourly rate calculation)
+    # Pre-pass: detect hourly rate + hours combinations (e.g., "$12/hour for 20 hours")
+    # This ensures we correctly associate each rate with its hours
+    hourly_with_hours_patterns = [
+        r'\$([0-9,.]+)\s*/?\s*(?:an?\s*)?hour\s*(?:for\s*)?(\d+)\s*hours?',  # "$12/hour for 20 hours"
+        r'\$([0-9,.]+)\s*/?\s*(?:an?\s*)?hour[,\s]*(\d+)\s*hours?',  # "$12/hour, 20 hours"
+        r'\$([0-9,.]+)\s*(?:per|an?)\s*hour\s*(?:for\s*)?(\d+)\s*hours?',  # "$12 per hour for 20 hours"
+    ]
+
+    # Store pre-computed hourly incomes to avoid double-processing
+    precomputed_hourly = []  # List of (rate, hours, monthly_amount, match_start, match_end)
+
+    for hp in hourly_with_hours_patterns:
+        for hm in re.finditer(hp, input_lower):
+            try:
+                rate = float(hm.group(1).replace(",", ""))
+                hours = int(hm.group(2))
+                if 1 <= hours <= 80 and rate >= 5:  # Reasonable ranges
+                    monthly = int(rate * hours * 4.33)
+                    precomputed_hourly.append((rate, hours, monthly, hm.start(), hm.end()))
+                    print(f"DEBUG - Pre-computed hourly: ${rate}/hr × {hours}hrs = ${monthly}/month")
+            except (ValueError, IndexError):
+                pass
+
+    # Pre-pass: detect standalone work hours mentioned (for hourly rates without explicit hours)
     detected_work_hours = []
     hours_patterns = [
         r'(\d+)\s*hours?\s*(?:a|per)\s*week',
@@ -585,13 +615,41 @@ def normalize_facts(input_raw: str) -> dict:
             try:
                 hours = int(hm.group(1))
                 if 1 <= hours <= 80:  # Reasonable range
-                    detected_work_hours.append(hours)
+                    # Don't add if already captured in precomputed_hourly
+                    already_captured = any(ph[1] == hours for ph in precomputed_hourly)
+                    if not already_captured:
+                        detected_work_hours.append(hours)
             except ValueError:
                 pass
     print(f"DEBUG - Detected work hours: {detected_work_hours}")
 
     # Track which hours have been used (for multi-job scenarios)
     used_hours_indices = set()
+
+    # First, add precomputed hourly incomes (rate + hours captured together)
+    for rate, hours, monthly, start_pos, end_pos in precomputed_hourly:
+        amount_key = f"{rate}_employment_hourly_precomputed"
+        if amount_key not in seen_amounts:
+            # Check for duplicate monthly amounts
+            is_duplicate = any(abs(seen - monthly) < 50 for seen in seen_monthly_amounts)
+            if not is_duplicate:
+                seen_amounts[amount_key] = monthly
+                seen_monthly_amounts.add(monthly)
+
+                income_source = {
+                    "type": "employment",
+                    "raw_amount": rate,
+                    "frequency": "hourly",
+                    "hours_per_week": hours,
+                    "monthly_amount": monthly
+                }
+                conf = calculate_extraction_confidence("income", rate, input_raw, "precomputed_hourly")
+                income_source["confidence"] = conf["confidence"]
+
+                facts["income_sources"].append(income_source)
+                total_income += monthly
+                facts["patterns_matched"].append(f"income:employment:hourly_with_hours")
+                print(f"DEBUG - Added precomputed hourly: ${rate}/hr × {hours}hrs = ${monthly}/month")
 
     # Process regular income patterns
     for pattern, income_type, frequency in income_patterns:
@@ -604,6 +662,13 @@ def normalize_facts(input_raw: str) -> dict:
                 # Skip very small amounts that are likely ages/hours, not income
                 if amount < 10 and frequency == 'monthly':
                     continue
+
+                # Skip hourly rates that were already precomputed with their hours
+                if frequency == 'hourly':
+                    already_precomputed = any(ph[0] == amount for ph in precomputed_hourly)
+                    if already_precomputed:
+                        print(f"DEBUG - Skipping ${amount}/hour - already precomputed with hours")
+                        continue
 
                 # Skip if this looks like rent/utilities/medical (not income)
                 # Use tight context: 20 chars before $ and 25 chars after the match
@@ -622,16 +687,21 @@ def normalize_facts(input_raw: str) -> dict:
                     is_expense = True
 
                 # Also check if the context contains expense words near the amount
-                expense_context = input_lower[max(0, match.start() - 30):min(len(input_lower), match.end() + 30)]
-                # Check for expense patterns (expense word before or after amount)
-                expense_patterns = [
-                    r'(?:rent|utilities?|heat(?:ing)?|medication|medical\s*costs?|electric|gas)\s*(?:of\s*|is\s*|averaging\s*|about\s*|around\s*)?\$',
-                    r'\$[0-9,.]+\s*/?\s*month\s*(?:for\s*)?(?:rent|utilities?|heat(?:ing)?|medication|medical)',  # "$X/month medication"
-                    r'rents?\s*(?:a\s*)?(?:room|apartment|house)?\s*(?:for\s*)?\$',  # "Rents a room for $X"
+                # Use tighter context around THIS specific dollar amount to avoid false positives
+                expense_context = input_lower[max(0, match.start() - 25):min(len(input_lower), match.end() + 25)]
+                # Check for expense patterns (expense word before or after THIS amount)
+                expense_patterns_tight = [
+                    r'(?:rent|utilities?|heat(?:ing)?|medication|medical\s*costs?|electric|gas)\s*(?:of\s*|is\s*|averaging\s*|about\s*|around\s*)?\$' + re.escape(str(int(amount))),
+                    r'\$' + re.escape(str(int(amount))) + r'\s*/?\s*month\s*(?:for\s*)?(?:rent|utilities?|heat(?:ing)?|medication|medical)',
+                    r'rents?\s*(?:a\s*)?(?:room|apartment|house)?\s*(?:for\s*)?\$' + re.escape(str(int(amount))),
+                    r'pays?\s*(?:electric|gas|utilities?|heat(?:ing)?)\s*(?:\w+\s*)*?\$' + re.escape(str(int(amount))),
+                    r'(?:electric|gas|utilities?)\s*(?:separately|about|around|averaging)\s*(?:\w+\s*)*?\$' + re.escape(str(int(amount))),
+                    r'\$' + re.escape(str(int(amount))) + r'\s*(?:for\s*)?(?:electric|gas|utilities?|heat)',
                 ]
-                for exp_pattern in expense_patterns:
+                for exp_pattern in expense_patterns_tight:
                     if re.search(exp_pattern, expense_context):
-                        if not re.search(r'(?:income|earns?|makes?|salary|wages?)', expense_context):
+                        # Make sure we're not filtering out income-related amounts
+                        if not re.search(r'(?:receives?|income|earns?|makes?|salary|wages?|support|alimony)\s*\$' + re.escape(str(int(amount))), expense_context):
                             is_expense = True
                             break
 
