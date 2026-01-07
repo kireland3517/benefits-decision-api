@@ -330,14 +330,15 @@ def normalize_facts(input_raw: str) -> dict:
     # 2. INCOME SOURCE PATTERNS (Enhanced with frequency normalization)
     # =========================================================================
     income_patterns = [
-        # Employment with frequency detection
-        (r'makes?\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*hour', 'employment', 'hourly'),
-        (r'makes?\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*week', 'employment', 'weekly'),
-        (r'makes?\s*(?:around\s*)?\$([0-9,]+)\s*(?:bi[-\s]?weekly|every\s*(?:two|2)\s*weeks?)', 'employment', 'biweekly'),
-        (r'makes?\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
-        (r'makes?\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*year', 'employment', 'yearly'),
-        (r'makes?\s*(?:around\s*)?\$([0-9,]+)', 'employment', 'monthly'),  # Default to monthly
+        # Employment with frequency detection (earns/makes)
+        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),
+        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*week', 'employment', 'weekly'),
+        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:bi[-\s]?weekly|every\s*(?:two|2)\s*weeks?)', 'employment', 'biweekly'),
+        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
+        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*year', 'employment', 'yearly'),
+        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)', 'employment', 'monthly'),  # Default to monthly
         (r'earning\s*\$([0-9,]+)', 'employment', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),  # "$15/hour"
         (r'\$([0-9,]+)\s*(?:a|per)\s*month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
         (r'\$([0-9,]+)\s*monthly', 'employment', 'monthly'),
         (r'\$([0-9,]+)\s*(?:before|gross)', 'employment', 'monthly'),
@@ -347,17 +348,25 @@ def normalize_facts(input_raw: str) -> dict:
         (r'(?:1099|freelance|gig|side\s*hustle|self[-\s]?employ)\s*.*?\$([0-9,]+)', 'self_employment', 'monthly'),
         (r'(?:uber|lyft|doordash|instacart)\s*.*?\$([0-9,]+)', 'gig_work', 'monthly'),
 
-        # Government benefits (always monthly)
+        # Government benefits (always monthly) - label before and after amount
         (r'unemployment\s*(?:of\s*|benefits?\s*(?:of\s*)?)?\$([0-9,]+)', 'unemployment', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?unemployment', 'unemployment', 'monthly'),
         (r'social\s*security\s*(?:of\s*)?\$([0-9,]+)', 'social_security', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?social\s*security', 'social_security', 'monthly'),
         (r'(?:ssi|ssdi)\s*(?:of\s*)?\$([0-9,]+)', 'ssi_ssdi', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?(?:ssi|ssdi)', 'ssi_ssdi', 'monthly'),
         (r'disability\s*(?:benefits?\s*)?(?:of\s*)?\$([0-9,]+)', 'disability', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?disability', 'disability', 'monthly'),
         (r'pension\s*(?:of\s*)?\$([0-9,]+)', 'pension', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?pension', 'pension', 'monthly'),
         (r'(?:va|veteran)\s*benefits?\s*(?:of\s*)?\$([0-9,]+)', 'va_benefits', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?(?:va|veteran)', 'va_benefits', 'monthly'),
 
         # Support payments
         (r'child\s*support\s*(?:of\s*)?\$([0-9,]+)', 'child_support', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?child\s*support', 'child_support', 'monthly'),
         (r'alimony\s*(?:of\s*)?\$([0-9,]+)', 'alimony', 'monthly'),
+        (r'\$([0-9,]+)\s*(?:from\s*)?alimony', 'alimony', 'monthly'),
 
         # Non-dollar income patterns
         (r'(?:makes?|earns?)\s*(?:around\s*|about\s*)?([0-9,]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
@@ -616,9 +625,9 @@ def normalize_facts(input_raw: str) -> dict:
     # =========================================================================
     deduction_patterns = [
         (r'(?:childcare|daycare|child\s*care)\s*(?:costs?\s*)?\$([0-9,]+)', 'childcare'),
-        (r'\$([0-9,]+)\s*(?:for\s*)?(?:childcare|daycare)', 'childcare'),
+        (r'\$([0-9,]+)\s*(?:(?:a|per|/)\s*month\s*)?(?:for\s*)?(?:childcare|daycare|child\s*care)', 'childcare'),
         (r'(?:medical|health)\s*(?:expenses?|bills?|costs?)\s*(?:of\s*)?\$([0-9,]+)', 'medical'),
-        (r'\$([0-9,]+)\s*(?:in\s*)?medical', 'medical'),
+        (r'\$([0-9,]+)\s*(?:in\s*)?(?:medical|health)\s*(?:expenses?|bills?)?', 'medical'),
         (r'pays?\s*(?:child\s*support|alimony)\s*(?:of\s*)?\$([0-9,]+)', 'court_ordered_support'),
         (r'(?:commute|transportation|work)\s*(?:costs?\s*)?\$([0-9,]+)', 'work_expenses'),
     ]
@@ -833,7 +842,8 @@ def generate_decision_map(facts: dict) -> dict:
             if facts.get("potential_deductions", {}).get("childcare"):
                 childcare_amt = facts["potential_deductions"]["childcare"]
                 deduction_opportunities.append(f"Dependent care deduction: ${childcare_amt} identified")
-            if facts.get("potential_deductions", {}).get("shelter_burden", 0) > 0.50:
+            shelter_burden = facts.get("potential_deductions", {}).get("shelter_burden")
+            if shelter_burden is not None and shelter_burden > 0.50:
                 deduction_opportunities.append("Excess shelter deduction may apply (housing costs exceed 50% of income)")
 
             if deduction_opportunities:
