@@ -263,15 +263,26 @@ def normalize_facts(input_raw: str) -> dict:
     # =========================================================================
     # 1. HOUSEHOLD SIZE PATTERNS (Enhanced with custody)
     # =========================================================================
+    # Map number words to digits
+    number_words = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8}
+
     household_patterns = [
+        # Explicit counts (highest priority)
+        (r'household\s*of\s*(\d+|four|five|six|seven|eight)', 'household_count'),
         (r'(\d+)\s*person\s*household', 'household_count'),
-        (r'family\s*of\s*(\d+)', 'family_count'),
+        (r'family\s*of\s*(\d+|four|five|six|seven|eight)', 'family_count'),
         (r'couple|married|husband|wife|spouse', 'couple'),
-        (r'(\d+)\s*child(?:ren)?', 'children'),
-        (r'single\s*(?:adult|mother|father|person)', 'single'),
+        (r'twin\s*(?:\d+[-\s]?year[-\s]?old)?\s*(?:boys?|girls?|children|kids)', 'twin_children'),  # twins = 2
+        (r'(\d+)\s*(?:u\.?s\.?\s*citizen\s*)?child(?:ren)?', 'children'),
+        (r'(?:children|kids)\s*ages?\s*(\d+)\s*and\s*(\d+)', 'children_ages'),  # "children ages 6 and 10"
+        (r'single\s*(?:adult|mother|father|person|mom|dad)', 'single'),
         (r'living\s*with\s*(\d+)\s*(?:other\s*)?people', 'living_with'),
         (r'(?:grand)?(?:mother|father|parent)s?\s*(?:living|staying)\s*with', 'multigenerational'),
-        (r'three\s*generations?|multi[-\s]?generational', 'multigenerational'),
+        (r'three[-\s]?generation(?:al)?\s*household', 'multigenerational'),  # "three-generation household"
+        (r'multi[-\s]?generational', 'multigenerational'),
+        # Explicit member counting
+        (r'grandmother.*daughter.*(?:son|grandson|child)', 'multigenerational'),  # 3+ generations
+        (r'(?:father|mother|parent).*(?:children|kids).*(?:ages?\s*\d+)', 'parent_with_children'),
     ]
 
     # Custody patterns
@@ -287,22 +298,46 @@ def normalize_facts(input_raw: str) -> dict:
         match = re.search(pattern, input_lower)
         if match:
             if pattern_type == 'household_count':
-                facts["household_size"] = int(match.group(1))
+                count_str = match.group(1)
+                if count_str in number_words:
+                    facts["household_size"] = number_words[count_str]
+                else:
+                    facts["household_size"] = int(count_str)
             elif pattern_type == 'family_count':
-                facts["household_size"] = int(match.group(1))
+                count_str = match.group(1)
+                if count_str in number_words:
+                    facts["household_size"] = number_words[count_str]
+                else:
+                    facts["household_size"] = int(count_str)
             elif pattern_type == 'couple':
                 facts["household_size"] = max(facts["household_size"], 2)
+            elif pattern_type == 'twin_children':
+                # Twins = 2 children, add to current household
+                facts["household_size"] = max(facts["household_size"], facts["household_size"] + 2)
+                facts["household_members"].append({"type": "children", "count": 2, "note": "twins"})
             elif pattern_type == 'children':
                 num_children = int(match.group(1))
                 facts["household_size"] = max(facts["household_size"], num_children + 1)
                 facts["household_members"].append({"type": "children", "count": num_children})
+            elif pattern_type == 'children_ages':
+                # "children ages 6 and 10" = 2 children
+                facts["household_size"] = max(facts["household_size"], 3)  # At least parent + 2 children
+                facts["household_members"].append({"type": "children", "count": 2})
             elif pattern_type == 'single':
-                facts["household_size"] = 1
+                # Only set to 1 if we haven't found children
+                if not facts["household_members"]:
+                    facts["household_size"] = 1
             elif pattern_type == 'living_with':
                 facts["household_size"] = int(match.group(1)) + 1
             elif pattern_type == 'multigenerational':
                 facts["household_size"] = max(facts["household_size"], 3)
-                facts["circumstances"].append("multigenerational")
+                if "multigenerational" not in facts["circumstances"]:
+                    facts["circumstances"].append("multigenerational")
+            elif pattern_type == 'parent_with_children':
+                # Look for explicit child count in surrounding context
+                child_match = re.search(r'(\d+)\s*(?:children|kids)', input_lower)
+                if child_match:
+                    facts["household_size"] = max(facts["household_size"], int(child_match.group(1)) + 1)
 
             conf = calculate_extraction_confidence("household", facts["household_size"], input_raw, pattern)
             facts["extraction_confidence"]["household_size"] = conf["confidence"]
@@ -329,64 +364,107 @@ def normalize_facts(input_raw: str) -> dict:
     # =========================================================================
     # 2. INCOME SOURCE PATTERNS (Enhanced with frequency normalization)
     # =========================================================================
-    income_patterns = [
-        # Employment with frequency detection (earns/makes)
-        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),
-        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*week', 'employment', 'weekly'),
-        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:bi[-\s]?weekly|every\s*(?:two|2)\s*weeks?)', 'employment', 'biweekly'),
-        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
-        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)\s*(?:a|per)\s*year', 'employment', 'yearly'),
-        (r'(?:makes?|earns?)\s*(?:around\s*)?\$([0-9,]+)', 'employment', 'monthly'),  # Default to monthly
-        (r'earning\s*\$([0-9,]+)', 'employment', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),  # "$15/hour"
-        (r'\$([0-9,]+)\s*(?:a|per)\s*month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
-        (r'\$([0-9,]+)\s*monthly', 'employment', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:before|gross)', 'employment', 'monthly'),
-        (r'salary\s*(?:of\s*)?\$([0-9,]+)', 'employment', 'yearly'),
+    # Helper to parse amounts (handles decimals and ranges)
+    def parse_amount(amount_str: str) -> float:
+        """Parse amount string, handling decimals and commas."""
+        return float(amount_str.replace(",", ""))
 
-        # Self-employment / Gig work
-        (r'(?:1099|freelance|gig|side\s*hustle|self[-\s]?employ)\s*.*?\$([0-9,]+)', 'self_employment', 'monthly'),
-        (r'(?:uber|lyft|doordash|instacart)\s*.*?\$([0-9,]+)', 'gig_work', 'monthly'),
+    income_patterns = [
+        # Employment with frequency detection (earns/makes) - supports decimals
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*week(?:ly)?', 'employment', 'weekly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:bi[-\s]?weekly|every\s*(?:two|2)\s*weeks?)', 'employment', 'biweekly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*year', 'employment', 'yearly'),
+        (r'\$([0-9,.]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),  # "$16.50/hour"
+        (r'\$([0-9,.]+)\s*(?:a|per)\s*month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:a|per)\s*week(?:ly)?', 'employment', 'weekly'),
+        (r'\$([0-9,.]+)\s*monthly', 'employment', 'monthly'),
+        (r'\$([0-9,.]+)\s*weekly', 'employment', 'weekly'),
+        (r'\$([0-9,.]+)\s*(?:before|gross)', 'employment', 'monthly'),
+        (r'salary\s*(?:of\s*)?\$([0-9,.]+)', 'employment', 'yearly'),
+        # Default monthly (must come after specific frequencies)
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)(?!\s*(?:a|per|/)\s*(?:hour|week|year))', 'employment', 'monthly'),
+
+        # Self-employment / Gig work / Side business
+        (r'(?:1099|freelance|gig|side\s*(?:hustle|business)|self[-\s]?employ)\s*.*?\$([0-9,.]+)', 'self_employment', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:from\s*)?(?:side\s*(?:hustle|business)|freelance)', 'self_employment', 'monthly'),
+        (r'(?:uber|lyft|doordash|instacart)\s*.*?\$([0-9,.]+)', 'gig_work', 'monthly'),
+        (r'cleaning\s*(?:offices?|houses?|business).*?\$([0-9,.]+)', 'self_employment', 'monthly'),
 
         # Government benefits (always monthly) - label before and after amount
-        (r'unemployment\s*(?:of\s*|benefits?\s*(?:of\s*)?)?\$([0-9,]+)', 'unemployment', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?unemployment', 'unemployment', 'monthly'),
-        (r'social\s*security\s*(?:of\s*)?\$([0-9,]+)', 'social_security', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?social\s*security', 'social_security', 'monthly'),
-        (r'(?:ssi|ssdi)\s*(?:of\s*)?\$([0-9,]+)', 'ssi_ssdi', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?(?:ssi|ssdi)', 'ssi_ssdi', 'monthly'),
-        (r'disability\s*(?:benefits?\s*)?(?:of\s*)?\$([0-9,]+)', 'disability', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?disability', 'disability', 'monthly'),
-        (r'pension\s*(?:of\s*)?\$([0-9,]+)', 'pension', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?pension', 'pension', 'monthly'),
-        (r'(?:va|veteran)\s*benefits?\s*(?:of\s*)?\$([0-9,]+)', 'va_benefits', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?(?:va|veteran)', 'va_benefits', 'monthly'),
+        (r'unemployment\s*(?:benefits?\s*)?(?:of\s*)?\$([0-9,.]+)', 'unemployment', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?unemployment', 'unemployment', 'monthly'),
+        (r'expecting\s*(?:about\s*)?\$([0-9,.]+)\s*(?:weekly|per\s*week)', 'unemployment_pending', 'weekly'),
+        (r'social\s*security\s*(?:of\s*)?\$([0-9,.]+)', 'social_security', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?social\s*security', 'social_security', 'monthly'),
+        (r'(?:ssi|ssdi)\s*(?:of\s*)?\$([0-9,.]+)', 'ssi_ssdi', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?(?:ssi|ssdi)', 'ssi_ssdi', 'monthly'),
+        (r'\$([0-9,.]+)\s*monthly\s*ssdi', 'ssi_ssdi', 'monthly'),  # "$914 monthly SSDI"
+        (r'disability\s*(?:benefits?\s*)?(?:of\s*)?\$([0-9,.]+)', 'disability', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?disability', 'disability', 'monthly'),
+        (r'gets?\s*\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?(?:ssi|ssdi|disability)', 'disability', 'monthly'),
+        (r'pension\s*(?:of\s*)?\$([0-9,.]+)', 'pension', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?pension', 'pension', 'monthly'),
+        (r'(?:va|veteran)\s*benefits?\s*(?:of\s*)?\$([0-9,.]+)', 'va_benefits', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?(?:va|veteran)', 'va_benefits', 'monthly'),
 
         # Support payments
-        (r'child\s*support\s*(?:of\s*)?\$([0-9,]+)', 'child_support', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?child\s*support', 'child_support', 'monthly'),
-        (r'alimony\s*(?:of\s*)?\$([0-9,]+)', 'alimony', 'monthly'),
-        (r'\$([0-9,]+)\s*(?:from\s*)?alimony', 'alimony', 'monthly'),
+        (r'(?:receives?\s*)?\$([0-9,.]+)\s*(?:monthly\s*)?child\s*support', 'child_support', 'monthly'),
+        (r'child\s*support\s*(?:of\s*)?\$([0-9,.]+)', 'child_support', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:from\s*)?child\s*support', 'child_support', 'monthly'),
+        (r'alimony\s*(?:of\s*)?\$([0-9,.]+)', 'alimony', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:from\s*)?alimony', 'alimony', 'monthly'),
 
         # Non-dollar income patterns
         (r'(?:makes?|earns?)\s*(?:around\s*|about\s*)?([0-9,]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
     ]
 
-    total_income = 0
-    seen_amounts = set()  # Avoid duplicate counting
+    # Income range patterns (take lower bound for conservative estimate)
+    income_range_patterns = [
+        (r'\$([0-9,.]+)[-–](?:\$)?([0-9,.]+)\s*(?:(?:a|per)\s*)?month', 'variable_income', 'monthly'),
+        (r'\$([0-9,.]+)[-–](?:\$)?([0-9,.]+)\s*(?:some\s*)?months?', 'variable_income', 'monthly'),
+        (r'\$([0-9,.]+)[-–](?:\$)?([0-9,.]+)\s*(?:(?:a|per)\s*)?week', 'variable_income', 'weekly'),
+        (r'(?:makes?|earns?)\s*\$([0-9,.]+)[-–](?:\$)?([0-9,.]+)', 'variable_income', 'monthly'),
+    ]
 
+    total_income = 0
+    seen_amounts = {}  # Track amounts with their types for deduplication
+    seen_monthly_amounts = set()  # Track normalized monthly amounts to prevent double-counting
+
+    # Process regular income patterns
     for pattern, income_type, frequency in income_patterns:
         patterns_attempted += 1
-        # Use findall to get ALL matches
         matches = re.finditer(pattern, input_lower)
         for match in matches:
             try:
-                amount = int(match.group(1).replace(",", ""))
+                amount = parse_amount(match.group(1))
 
-                # Skip if we've seen this exact amount (likely duplicate pattern match)
-                if amount in seen_amounts and income_type == 'employment':
+                # Skip very small amounts that are likely ages/hours, not income
+                if amount < 10 and frequency == 'monthly':
                     continue
-                seen_amounts.add(amount)
+
+                # Calculate monthly for deduplication check
+                multiplier = FREQUENCY_TO_MONTHLY.get(frequency, 1.0)
+                monthly_check = int(amount * multiplier)
+
+                # Skip if we've seen this exact raw amount with this type
+                amount_key = f"{amount}_{income_type}"
+                if amount_key in seen_amounts:
+                    continue
+
+                # Skip if the monthly amount is very close to one we've already seen
+                # This prevents counting $914 SSDI multiple times with different type labels
+                is_duplicate = False
+                for seen_monthly in seen_monthly_amounts:
+                    if abs(seen_monthly - monthly_check) < 50:  # Within $50 = likely same source
+                        is_duplicate = True
+                        break
+                if is_duplicate:
+                    continue
+
+                seen_amounts[amount_key] = monthly_check
+                seen_monthly_amounts.add(monthly_check)
 
                 # Normalize to monthly
                 multiplier = FREQUENCY_TO_MONTHLY.get(frequency, 1.0)
@@ -415,6 +493,53 @@ def normalize_facts(input_raw: str) -> dict:
                 })
                 facts["extraction_debug"]["confidence_factors"][f"income_{income_type}"] = conf["factors"]
                 print(f"DEBUG - Income matched: {income_type} = ${amount}/{frequency} -> ${monthly_amount}/month")
+
+            except (ValueError, IndexError):
+                continue
+
+    # Process income range patterns (use lower bound for conservative estimate)
+    for pattern, income_type, frequency in income_range_patterns:
+        patterns_attempted += 1
+        matches = re.finditer(pattern, input_lower)
+        for match in matches:
+            try:
+                low_amount = parse_amount(match.group(1))
+                high_amount = parse_amount(match.group(2))
+
+                # Use average for estimation, but flag as variable
+                amount = (low_amount + high_amount) / 2
+
+                # Skip if we already captured this range
+                range_key = f"{low_amount}-{high_amount}"
+                if range_key in seen_amounts:
+                    continue
+
+                multiplier = FREQUENCY_TO_MONTHLY.get(frequency, 1.0)
+                monthly_amount = int(amount * multiplier)
+
+                seen_amounts[range_key] = monthly_amount
+                seen_monthly_amounts.add(monthly_amount)
+
+                income_source = {
+                    "type": income_type,
+                    "raw_amount": f"{low_amount}-{high_amount}",
+                    "frequency": frequency,
+                    "monthly_amount": monthly_amount,
+                    "is_variable": True,
+                    "range_low": int(low_amount * multiplier),
+                    "range_high": int(high_amount * multiplier)
+                }
+
+                conf = calculate_extraction_confidence("income", amount, input_raw, pattern)
+                conf["confidence"] -= 0.10  # Reduce confidence for ranges
+                income_source["confidence"] = max(0.3, conf["confidence"])
+
+                facts["income_sources"].append(income_source)
+                facts["income_irregular"] = True
+                total_income += monthly_amount
+
+                facts["patterns_matched"].append(f"income:{income_type}:range:{frequency}")
+                print(f"DEBUG - Income range matched: {income_type} = ${low_amount}-${high_amount}/{frequency} -> ${monthly_amount}/month (avg)")
 
             except (ValueError, IndexError):
                 continue
@@ -624,12 +749,22 @@ def normalize_facts(input_raw: str) -> dict:
     # 8. DEDUCTION PATTERN EXTRACTION (Informational Only)
     # =========================================================================
     deduction_patterns = [
-        (r'(?:childcare|daycare|child\s*care)\s*(?:costs?\s*)?\$([0-9,]+)', 'childcare'),
-        (r'\$([0-9,]+)\s*(?:(?:a|per|/)\s*month\s*)?(?:for\s*)?(?:childcare|daycare|child\s*care)', 'childcare'),
-        (r'(?:medical|health)\s*(?:expenses?|bills?|costs?)\s*(?:of\s*)?\$([0-9,]+)', 'medical'),
-        (r'\$([0-9,]+)\s*(?:in\s*)?(?:medical|health)\s*(?:expenses?|bills?)?', 'medical'),
-        (r'pays?\s*(?:child\s*support|alimony)\s*(?:of\s*)?\$([0-9,]+)', 'court_ordered_support'),
-        (r'(?:commute|transportation|work)\s*(?:costs?\s*)?\$([0-9,]+)', 'work_expenses'),
+        # Childcare / After-school
+        (r'(?:childcare|daycare|child\s*care|after[-\s]?school)\s*(?:program\s*)?(?:costs?\s*)?\$([0-9,.]+)', 'childcare'),
+        (r'\$([0-9,.]+)\s*(?:(?:a|per|/)\s*month\s*)?(?:for\s*)?(?:childcare|daycare|child\s*care|after[-\s]?school)', 'childcare'),
+        (r'pays?\s*\$([0-9,.]+)\s*(?:(?:a|per|/)\s*month\s*)?(?:for\s*)?(?:daughter|son|child)(?:\'?s)?\s*(?:after[-\s]?school|daycare|care)', 'childcare'),
+
+        # Medical expenses
+        (r'(?:medical|health|medication|prescription|doctor)\s*(?:expenses?|bills?|costs?|visits?)\s*(?:costing\s*)?(?:around\s*)?(?:of\s*)?\$([0-9,.]+)', 'medical'),
+        (r'\$([0-9,.]+)\s*(?:(?:a|per|/)\s*month\s*)?(?:in\s*|for\s*)?(?:medical|health|medication)', 'medical'),
+        (r'(?:costing|costs?)\s*(?:around\s*|about\s*)?\$([0-9,.]+)\s*(?:(?:a|per|/)\s*month)?(?:\s*(?:even\s*)?with\s*(?:medicare|insurance))?', 'medical'),
+        (r'(?:treatment|medication)\s*(?:costs?|expenses?)\s*(?:about\s*)?\$([0-9,.]+)', 'medical'),
+
+        # Court-ordered support
+        (r'pays?\s*(?:child\s*support|alimony)\s*(?:of\s*)?\$([0-9,.]+)', 'court_ordered_support'),
+
+        # Work-related expenses
+        (r'(?:commute|transportation|work)\s*(?:costs?\s*)?\$([0-9,.]+)', 'work_expenses'),
     ]
 
     for pattern, deduction_type in deduction_patterns:
@@ -637,10 +772,12 @@ def normalize_facts(input_raw: str) -> dict:
         match = re.search(pattern, input_lower)
         if match:
             try:
-                amount = int(match.group(1).replace(",", ""))
-                facts["potential_deductions"][deduction_type] = amount
-                facts["patterns_matched"].append(f"deduction:{deduction_type}")
-                print(f"DEBUG - Deduction matched: {deduction_type} = ${amount}")
+                amount = int(parse_amount(match.group(1)))
+                # Only update if not already set (first match wins)
+                if facts["potential_deductions"].get(deduction_type) is None:
+                    facts["potential_deductions"][deduction_type] = amount
+                    facts["patterns_matched"].append(f"deduction:{deduction_type}")
+                    print(f"DEBUG - Deduction matched: {deduction_type} = ${amount}")
             except (ValueError, IndexError):
                 pass
 
