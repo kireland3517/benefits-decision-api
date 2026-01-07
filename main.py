@@ -123,13 +123,21 @@ def normalize_facts(input_raw: str) -> dict:
     input_lower = input_raw.lower()
 
     # Extract income - handle various formats
+    print(f"DEBUG - Raw input: {input_raw}")
     income_match = re.search(r'\$?([0-9,]+)', input_raw)
+    print(f"DEBUG - Income regex match: {income_match}")
     if income_match:
+        print(f"DEBUG - Matched text: {income_match.group(0)}")
+        print(f"DEBUG - Captured group: {income_match.group(1)}")
         try:
             income_str = income_match.group(1).replace(",", "")
             facts["gross_monthly_income"] = int(income_str)
+            print(f"DEBUG - Final income: {facts['gross_monthly_income']}")
         except (ValueError, AttributeError):
+            print("DEBUG - Failed to convert income to int")
             pass
+    else:
+        print("DEBUG - No income found in text")
 
     # Extract age
     if "58" in input_raw:
