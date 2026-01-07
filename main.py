@@ -2339,6 +2339,45 @@ async def get_org_runs(
 
         return response.json()
 
+
+# =============================================================================
+# PUBLIC DEMO ENDPOINT (no auth required)
+# =============================================================================
+
+class DemoRequest(BaseModel):
+    input_raw: str
+    email: str | None = None  # Optional lead capture
+
+class DemoResponse(BaseModel):
+    multi_program: dict
+    facts_extracted: dict
+
+@app.post("/demo", response_model=DemoResponse)
+async def demo_screening(request: DemoRequest):
+    """Public demo endpoint - no auth required"""
+
+    # Basic rate limiting: reject if input is too long
+    if len(request.input_raw) > 5000:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Input too long (max 5000 characters)"
+        )
+
+    facts = normalize_facts(request.input_raw)
+    multi_program = generate_multi_program_eligibility(facts)
+
+    # TODO: Store email to Supabase for lead capture if provided
+
+    return DemoResponse(
+        multi_program=multi_program,
+        facts_extracted={
+            "household_size": facts.get("household_size"),
+            "total_monthly_income": facts.get("total_monthly_income"),
+            "income_sources": facts.get("income_sources", [])
+        }
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
