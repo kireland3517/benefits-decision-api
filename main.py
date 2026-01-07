@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Optional, List, Literal
 import os
 import jwt
 import httpx
@@ -36,6 +37,73 @@ class RunResponse(BaseModel):
     run_id: str
     decision_map: dict  # SNAP-only (backward compatible)
     multi_program: dict  # All 6 programs
+
+
+# =========================================================================
+# STRUCTURED INPUT MODELS (for case management system integrations)
+# =========================================================================
+
+class IncomeItem(BaseModel):
+    """Individual income source"""
+    type: Literal[
+        "employment", "self_employment", "social_security", "ssi", "ssdi",
+        "pension", "va_benefits", "unemployment", "child_support", "alimony",
+        "rental_income", "investment", "workers_comp", "other"
+    ]
+    amount: float = Field(..., ge=0, description="Income amount")
+    frequency: Literal["hourly", "weekly", "biweekly", "monthly", "yearly"] = "monthly"
+    hours_per_week: Optional[int] = Field(None, ge=1, le=80, description="Hours per week (for hourly)")
+
+class ExpenseItem(BaseModel):
+    """Individual expense"""
+    type: Literal[
+        "rent", "mortgage", "utilities", "heating", "cooling", "electric",
+        "gas", "water", "phone", "childcare", "medical", "child_support_paid",
+        "alimony_paid", "other"
+    ]
+    amount: float = Field(..., ge=0)
+    frequency: Literal["weekly", "monthly", "yearly"] = "monthly"
+
+class PersonInput(BaseModel):
+    """Individual household member"""
+    role: Literal[
+        "head_of_household", "spouse", "child", "parent", "grandparent",
+        "sibling", "other_relative", "unrelated"
+    ]
+    age: Optional[int] = Field(None, ge=0, le=120)
+    pregnant: bool = False
+    postpartum: bool = False
+    breastfeeding: bool = False
+    disabled: bool = False
+    veteran: bool = False
+    student: bool = False
+    on_medicare: bool = False
+    citizen_or_eligible_noncitizen: bool = True  # Eligibility for federal benefits
+    applying_for_benefits: bool = True  # Whether this person is applying
+    income: List[IncomeItem] = []
+    expenses: List[ExpenseItem] = []
+
+class HouseholdInput(BaseModel):
+    """Household-level information"""
+    housing_type: Optional[Literal[
+        "renting", "own_with_mortgage", "own_outright", "living_with_others",
+        "homeless", "shelter", "transitional", "subsidized", "section_8"
+    ]] = None
+    rent_amount: Optional[float] = Field(None, ge=0)
+    mortgage_amount: Optional[float] = Field(None, ge=0)
+    utilities_included: bool = False
+    utilities_separate: bool = False
+    heating_type: Optional[Literal["electric", "gas", "oil", "propane", "wood", "none"]] = None
+    has_heating_costs: bool = False
+    has_cooling_costs: bool = False
+
+class StructuredRunRequest(BaseModel):
+    """Structured input for case management system integrations"""
+    org_id: str
+    household: HouseholdInput = HouseholdInput()
+    persons: List[PersonInput] = []
+    withhold_payload: bool = Field(False, description="Don't store raw input for privacy")
+
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify Supabase JWT and extract user ID"""
@@ -1707,6 +1775,220 @@ def generate_multi_program_eligibility(facts: dict) -> dict:
 
 
 # =============================================================================
+# STRUCTURED INPUT NORMALIZER (maps structured JSON to same facts dict)
+# =============================================================================
+def normalize_facts_from_structured(request: 'StructuredRunRequest') -> dict:
+    """
+    Convert structured input to the same facts dictionary format used by
+    the free-text parser. This allows both input methods to use the same
+    eligibility logic.
+    """
+    # Frequency multipliers (same as free-text parser)
+    FREQUENCY_TO_MONTHLY = {
+        'hourly': 173.33,  # 40 hrs/week × 4.33 weeks (default)
+        'weekly': 4.33,
+        'biweekly': 2.167,
+        'monthly': 1.0,
+        'yearly': 0.0833
+    }
+
+    household = request.household
+    persons = request.persons
+
+    # Initialize facts structure (same as normalize_facts)
+    facts = {
+        # HOUSEHOLD
+        "household_size": len(persons) if persons else 1,
+        "household_members": [],
+
+        # INCOME
+        "income_sources": [],
+        "total_monthly_income": 0,
+        "gross_monthly_income": 0,
+        "income_irregular": False,
+
+        # CHILDREN (for WIC, School Lunch)
+        "children_under_5": 0,
+        "children_school_age": 0,
+        "infants_under_1": 0,
+
+        # PREGNANCY/MATERNAL (for WIC, Medicaid)
+        "pregnant": False,
+        "pregnancy_weeks": None,
+        "postpartum": False,
+        "breastfeeding": False,
+
+        # MEDICARE (for MSP)
+        "medicare_eligible": False,
+        "on_medicare": False,
+
+        # HOUSING
+        "rent": household.rent_amount,
+        "mortgage": household.mortgage_amount,
+        "housing_type": household.housing_type,
+        "housing_instability": household.housing_type in ["homeless", "shelter", "transitional", "living_with_others"] if household.housing_type else None,
+
+        # UTILITIES (for LIHEAP)
+        "utilities_included": household.utilities_included,
+        "utilities_separate": household.utilities_separate,
+        "has_heating_cooling_costs": household.has_heating_costs or household.has_cooling_costs,
+        "heating_type": household.heating_type,
+
+        # DEMOGRAPHICS
+        "ages": [],
+        "elderly_in_household": False,
+        "disabled_in_household": False,
+        "veteran_in_household": False,
+
+        # CIRCUMSTANCES
+        "circumstances": [],
+
+        # DEDUCTIONS (informational)
+        "potential_deductions": {
+            "childcare": None,
+            "medical": None,
+            "child_support_paid": None,
+            "shelter_burden": None
+        },
+
+        # METADATA
+        "input_type": "structured",
+        "missing_critical_info": [],
+        "extraction_confidence": {},
+        "patterns_matched": [],
+        "extraction_debug": {
+            "structured_input": True,
+            "data_quality_score": 0.95  # Structured input is high confidence
+        }
+    }
+
+    # Process each person
+    total_income = 0
+    total_childcare = 0
+    total_medical = 0
+    total_child_support_paid = 0
+
+    for person in persons:
+        # Add to household members
+        member = {
+            "role": person.role,
+            "age": person.age,
+            "applying": person.applying_for_benefits
+        }
+        facts["household_members"].append(member)
+
+        # Track age
+        if person.age is not None:
+            facts["ages"].append(person.age)
+
+            # Categorize children
+            if person.age < 1:
+                facts["infants_under_1"] += 1
+            if person.age < 5:
+                facts["children_under_5"] += 1
+            if 5 <= person.age <= 18:
+                facts["children_school_age"] += 1
+
+            # Track elderly
+            if person.age >= 60:
+                facts["elderly_in_household"] = True
+            if person.age >= 65:
+                facts["medicare_eligible"] = True
+
+        # Track flags
+        if person.pregnant:
+            facts["pregnant"] = True
+        if person.postpartum:
+            facts["postpartum"] = True
+        if person.breastfeeding:
+            facts["breastfeeding"] = True
+        if person.disabled:
+            facts["disabled_in_household"] = True
+            if "disabled" not in facts["circumstances"]:
+                facts["circumstances"].append("disabled")
+        if person.veteran:
+            facts["veteran_in_household"] = True
+            if "veteran" not in facts["circumstances"]:
+                facts["circumstances"].append("veteran")
+        if person.on_medicare:
+            facts["on_medicare"] = True
+            facts["medicare_eligible"] = True
+
+        # Process income for this person
+        for income in person.income:
+            # Calculate monthly amount
+            if income.frequency == "hourly" and income.hours_per_week:
+                monthly = income.amount * income.hours_per_week * 4.33
+            else:
+                multiplier = FREQUENCY_TO_MONTHLY.get(income.frequency, 1.0)
+                monthly = income.amount * multiplier
+
+            monthly = int(monthly)
+
+            income_source = {
+                "type": income.type,
+                "raw_amount": income.amount,
+                "frequency": income.frequency,
+                "monthly_amount": monthly,
+                "confidence": 0.95,  # Structured input is high confidence
+                "person_role": person.role
+            }
+            if income.hours_per_week:
+                income_source["hours_per_week"] = income.hours_per_week
+
+            facts["income_sources"].append(income_source)
+            total_income += monthly
+
+        # Process expenses for this person (for deductions tracking)
+        for expense in person.expenses:
+            multiplier = FREQUENCY_TO_MONTHLY.get(expense.frequency, 1.0)
+            monthly = expense.amount * multiplier
+
+            if expense.type == "childcare":
+                total_childcare += monthly
+            elif expense.type == "medical":
+                total_medical += monthly
+            elif expense.type == "child_support_paid":
+                total_child_support_paid += monthly
+
+    # Set totals
+    facts["total_monthly_income"] = total_income
+    facts["gross_monthly_income"] = total_income
+
+    # Set deductions
+    if total_childcare > 0:
+        facts["potential_deductions"]["childcare"] = int(total_childcare)
+    if total_medical > 0:
+        facts["potential_deductions"]["medical"] = int(total_medical)
+    if total_child_support_paid > 0:
+        facts["potential_deductions"]["child_support_paid"] = int(total_child_support_paid)
+
+    # Calculate shelter burden
+    shelter_cost = (household.rent_amount or 0) + (household.mortgage_amount or 0)
+    if total_income > 0 and shelter_cost > 0:
+        facts["potential_deductions"]["shelter_burden"] = round(shelter_cost / total_income, 2)
+
+    # Set confidence scores (structured input is high confidence)
+    facts["extraction_confidence"] = {
+        "household_size": 0.95,
+        "income": 0.95,
+        "housing": 0.95 if household.housing_type else 0.5
+    }
+
+    # Check for missing critical info
+    if not facts["income_sources"]:
+        facts["missing_critical_info"].append("income")
+    if facts["household_size"] == 0:
+        facts["missing_critical_info"].append("household_size")
+
+    # Add housing instability circumstance
+    if facts["housing_instability"]:
+        facts["circumstances"].append("housing_instability")
+
+    return facts
+
+
+# =============================================================================
 # DECISION MAP GENERATION (SNAP-only, backward compatible)
 # =============================================================================
 def generate_decision_map(facts: dict) -> dict:
@@ -1943,6 +2225,84 @@ async def create_run(
             )
 
     return RunResponse(run_id=run_id, decision_map=decision_map, multi_program=multi_program)
+
+
+@app.post("/runs/structured", response_model=RunResponse)
+async def create_structured_run(
+    request: StructuredRunRequest,
+    user_id: str = Depends(verify_token)
+):
+    """
+    Create a new eligibility run from structured JSON input.
+
+    This endpoint is designed for case management systems that can submit
+    clean, structured data (household info + array of persons with income/expenses).
+
+    Benefits over /runs (free-text):
+    - Higher confidence scores (0.95 vs 0.65-0.85)
+    - No parsing ambiguity
+    - Explicit per-person income tracking
+    - Better support for complex households
+
+    Use withhold_payload=true to prevent storing raw input for privacy.
+    """
+
+    # Verify org membership
+    membership = await verify_org_membership(user_id, request.org_id)
+
+    # Normalize structured input to facts dict
+    facts = normalize_facts_from_structured(request)
+
+    # Generate decision map (SNAP-only, backward compatible)
+    decision_map = generate_decision_map(facts)
+
+    # Generate multi-program eligibility (all 6 programs)
+    multi_program = generate_multi_program_eligibility(facts)
+
+    # Store run in database
+    run_id = str(uuid.uuid4())
+
+    async with httpx.AsyncClient() as client:
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        # Build run data
+        run_data = {
+            "id": run_id,
+            "org_id": request.org_id,
+            "created_by": user_id,
+            "facts_normalized": facts,
+            "decision_map": decision_map,
+            "multi_program": multi_program
+        }
+
+        # Store structured input unless withhold_payload is set
+        if not request.withhold_payload:
+            run_data["input_raw"] = json.dumps({
+                "type": "structured",
+                "household": request.household.model_dump(),
+                "persons": [p.model_dump() for p in request.persons]
+            })
+        else:
+            run_data["input_raw"] = "[WITHHELD FOR PRIVACY]"
+
+        response = await client.post(
+            f"{SUPABASE_URL}/rest/v1/runs",
+            headers=headers,
+            json=run_data
+        )
+
+        if response.status_code not in [200, 201]:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to store run"
+            )
+
+    return RunResponse(run_id=run_id, decision_map=decision_map, multi_program=multi_program)
+
 
 @app.get("/orgs/{org_id}/runs")
 async def get_org_runs(
