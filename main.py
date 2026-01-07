@@ -104,82 +104,261 @@ async def verify_org_membership(user_id: str, org_id: str):
         return members[0]
 
 def normalize_facts(input_raw: str) -> dict:
-    """Extract structured facts from free text input"""
-    # Simple fact extraction for MVP
-    # TODO: Use LLM for better extraction
+    """Comprehensive fact extraction based on actual intake form patterns"""
+
+    print(f"DEBUG - Raw input: {input_raw}")
 
     facts = {
+        # HOUSEHOLD COMPOSITION
         "household_size": 1,
-        "age": None,
-        "gross_monthly_income": None,
+        "household_members": [],
+        "living_situation": None,
+
+        # INCOME SOURCES
+        "income_sources": [],
+        "total_monthly_income": None,
+        "gross_monthly_income": None,  # Keep for backward compatibility
+
+        # DEMOGRAPHICS
+        "ages": [],
+        "elderly_in_household": False,
+        "disabled_in_household": False,
+
+        # EMPLOYMENT
+        "employment_status": None,
+        "work_hours": None,
+
+        # HOUSING
+        "housing_type": None,
         "rent": None,
         "utilities_separate": False,
         "utility_cost": None,
-        "employment": None,
-        "prior_snap_denial": False
+
+        # SPECIAL CIRCUMSTANCES
+        "circumstances": [],
+        "prior_snap_denial": False,
+
+        # EXTRACTION INFO
+        "patterns_matched": [],
+        "missing_critical_info": []
     }
 
-    # Basic pattern matching
     input_lower = input_raw.lower()
 
-    # Extract income - handle various formats
-    print(f"DEBUG - Raw input: {input_raw}")
-
-    # Look for money patterns more specifically
-    income_patterns = [
-        r'\$([0-9,]+)',  # $4,500
-        r'making.*?([0-9,]+).*?month',  # making 4,500 per month
-        r'([0-9,]+).*?per month',  # 4,500 per month
-        r'([0-9,]+).*?monthly'  # 4,500 monthly
+    # 1. HOUSEHOLD SIZE PATTERNS
+    household_patterns = [
+        (r'(\d+)\s*person\s*household', 'household_count'),
+        (r'family\s*of\s*(\d+)', 'family_count'),
+        (r'couple|married|husband|wife|spouse', 'couple'),
+        (r'(\d+)\s*child(?:ren)?', 'children'),
+        (r'single\s*(?:adult|mother|father|person)', 'single'),
+        (r'living\s*with\s*(\d+)\s*(?:other\s*)?people', 'living_with')
     ]
 
-    income_found = None
-    for pattern in income_patterns:
-        match = re.search(pattern, input_raw, re.IGNORECASE)
+    for pattern, pattern_type in household_patterns:
+        match = re.search(pattern, input_lower)
+        if match:
+            if pattern_type == 'household_count':
+                facts["household_size"] = int(match.group(1))
+            elif pattern_type == 'family_count':
+                facts["household_size"] = int(match.group(1))
+            elif pattern_type == 'couple':
+                facts["household_size"] = max(facts["household_size"], 2)
+            elif pattern_type == 'children':
+                num_children = int(match.group(1))
+                facts["household_size"] = max(facts["household_size"], num_children + 1)
+            elif pattern_type == 'single':
+                facts["household_size"] = 1
+            elif pattern_type == 'living_with':
+                facts["household_size"] = int(match.group(1)) + 1
+            facts["patterns_matched"].append(f"household: {pattern}")
+            print(f"DEBUG - Household pattern matched: {pattern} -> size={facts['household_size']}")
+
+    # 2. INCOME SOURCE PATTERNS (comprehensive)
+    income_patterns = [
+        # Employment income with dollar sign
+        (r'makes?\s*(?:around\s*)?\$([0-9,]+)', 'employment'),
+        (r'earning\s*\$([0-9,]+)', 'employment'),
+        (r'\$([0-9,]+)\s*(?:a|per)\s*month', 'employment'),
+        (r'\$([0-9,]+)\s*monthly', 'employment'),
+        (r'\$([0-9,]+)\s*(?:before|gross)', 'employment'),
+
+        # Government benefits
+        (r'unemployment\s*(?:of\s*)?\$([0-9,]+)', 'unemployment'),
+        (r'social\s*security\s*(?:of\s*)?\$([0-9,]+)', 'social_security'),
+        (r'(?:ssi|ssdi|disability)\s*(?:of\s*)?\$([0-9,]+)', 'disability'),
+        (r'pension\s*(?:of\s*)?\$([0-9,]+)', 'pension'),
+
+        # Other income
+        (r'child\s*support\s*(?:of\s*)?\$([0-9,]+)', 'child_support'),
+        (r'alimony\s*(?:of\s*)?\$([0-9,]+)', 'alimony'),
+    ]
+
+    total_income = 0
+    for pattern, income_type in income_patterns:
+        match = re.search(pattern, input_lower)
         if match:
             try:
-                income_str = match.group(1).replace(",", "")
-                income_found = int(income_str)
-                print(f"DEBUG - Found income {income_found} with pattern: {pattern}")
-                break
+                amount = int(match.group(1).replace(",", ""))
+                facts["income_sources"].append({
+                    "type": income_type,
+                    "amount": amount,
+                    "frequency": "monthly"
+                })
+                total_income += amount
+                facts["patterns_matched"].append(f"income: {pattern} -> ${amount}")
+                print(f"DEBUG - Income pattern matched: {income_type} = ${amount}")
             except (ValueError, IndexError):
                 continue
 
-    if income_found:
-        facts["gross_monthly_income"] = income_found
+    if total_income > 0:
+        facts["total_monthly_income"] = total_income
+        facts["gross_monthly_income"] = total_income  # Backward compatibility
     else:
+        facts["missing_critical_info"].append("income")
         print("DEBUG - No income pattern matched")
 
-    # Extract age
-    if "58" in input_raw:
-        facts["age"] = 58
+    # 3. AGE PATTERNS
+    age_patterns = [
+        (r'(\d+)\s*years?\s*old', 'age'),
+        (r'age[sd]?\s*(\d+)', 'age'),
+        (r'elderly|senior', 'elderly'),
+        (r'retired', 'retired'),
+    ]
 
-    # Extract rent
-    if "950" in input_raw:
-        facts["rent"] = 950
+    for pattern, pattern_type in age_patterns:
+        match = re.search(pattern, input_lower)
+        if match:
+            if pattern_type == 'age':
+                age = int(match.group(1))
+                facts["ages"].append(age)
+                if age >= 60:
+                    facts["elderly_in_household"] = True
+                facts["patterns_matched"].append(f"age: {age}")
+                print(f"DEBUG - Age pattern matched: {age}")
+            elif pattern_type in ['elderly', 'retired']:
+                facts["elderly_in_household"] = True
+                facts["patterns_matched"].append(f"age: {pattern_type}")
 
-    # Extract utilities
-    if "180" in input_raw:
-        facts["utility_cost"] = 180
-        facts["utilities_separate"] = True
+    # 4. HOUSING PATTERNS
+    housing_patterns = [
+        (r'rent\s*(?:is\s*)?\$([0-9,]+)', 'rent_amount'),
+        (r'\$([0-9,]+)\s*(?:for\s*)?rent', 'rent_amount'),
+        (r'mortgage\s*(?:is\s*)?\$([0-9,]+)', 'mortgage_amount'),
+        (r'owns?\s*(?:a\s*)?(?:home|house|condo)', 'own'),
+        (r'lives?\s*with\s*(?:family|friend|parent)', 'shared'),
+        (r'homeless|no\s*permanent\s*address', 'homeless'),
+        (r'section\s*8|housing\s*voucher|subsidized', 'subsidized'),
+    ]
 
-    # Employment
-    if "part-time" in input_lower:
-        facts["employment"] = "part-time"
+    for pattern, pattern_type in housing_patterns:
+        match = re.search(pattern, input_lower)
+        if match:
+            if pattern_type == 'rent_amount':
+                facts["rent"] = int(match.group(1).replace(",", ""))
+                facts["housing_type"] = "rent"
+                print(f"DEBUG - Rent matched: ${facts['rent']}")
+            elif pattern_type == 'mortgage_amount':
+                facts["rent"] = int(match.group(1).replace(",", ""))
+                facts["housing_type"] = "own"
+            else:
+                facts["housing_type"] = pattern_type
+            facts["patterns_matched"].append(f"housing: {pattern}")
 
-    # Prior denial
-    if "lost snap" in input_lower or "denied" in input_lower:
-        facts["prior_snap_denial"] = True
+    # 5. UTILITY PATTERNS
+    utility_patterns = [
+        (r'(?:utilities?|electric|gas|heat)\s*(?:is\s*|of\s*|about\s*)?\$([0-9,]+)', 'utility'),
+        (r'\$([0-9,]+)\s*(?:for\s*)?(?:utilities?|electric|gas)', 'utility'),
+        (r'pays?\s*(?:electric|gas|utilities?)\s*separate', 'separate'),
+    ]
+
+    for pattern, pattern_type in utility_patterns:
+        match = re.search(pattern, input_lower)
+        if match:
+            if pattern_type == 'utility':
+                facts["utility_cost"] = int(match.group(1).replace(",", ""))
+                facts["utilities_separate"] = True
+                print(f"DEBUG - Utility cost matched: ${facts['utility_cost']}")
+            elif pattern_type == 'separate':
+                facts["utilities_separate"] = True
+            facts["patterns_matched"].append(f"utility: {pattern}")
+
+    # 6. EMPLOYMENT STATUS
+    employment_patterns = [
+        (r'part[\s-]*time', 'part-time'),
+        (r'full[\s-]*time', 'full-time'),
+        (r'unemployed|not\s*working|lost\s*(?:my\s*)?job', 'unemployed'),
+        (r'retired', 'retired'),
+        (r'disabled|disability', 'disabled'),
+        (r'(\d+)\s*hours?\s*(?:a|per)\s*week', 'hours'),
+    ]
+
+    for pattern, pattern_type in employment_patterns:
+        match = re.search(pattern, input_lower)
+        if match:
+            if pattern_type == 'hours':
+                facts["work_hours"] = int(match.group(1))
+            else:
+                facts["employment_status"] = pattern_type
+            facts["patterns_matched"].append(f"employment: {pattern}")
+            print(f"DEBUG - Employment pattern matched: {pattern_type}")
+
+    # 7. SPECIAL CIRCUMSTANCES
+    circumstances_patterns = [
+        (r'domestic\s*violence|abuse|restraining\s*order', 'domestic_violence'),
+        (r'homeless|shelter|living\s*in\s*(?:car|street)', 'homeless'),
+        (r'disabled?|disability|impair', 'disabled'),
+        (r'laid\s*off|fired|quit|lost\s*(?:my\s*)?job', 'job_loss'),
+        (r'medical\s*(?:bills?|expenses?)', 'medical_expenses'),
+        (r'lost\s*snap|denied|too\s*much', 'prior_denial'),
+        (r'hasn\'?t?\s*applied|never\s*applied', 'never_applied'),
+    ]
+
+    for pattern, circumstance in circumstances_patterns:
+        match = re.search(pattern, input_lower)
+        if match:
+            facts["circumstances"].append(circumstance)
+            if circumstance == 'prior_denial':
+                facts["prior_snap_denial"] = True
+            if circumstance == 'disabled':
+                facts["disabled_in_household"] = True
+            facts["patterns_matched"].append(f"circumstance: {circumstance}")
+            print(f"DEBUG - Circumstance matched: {circumstance}")
+
+    print(f"DEBUG - Final facts: household_size={facts['household_size']}, income=${facts['total_monthly_income']}, patterns={len(facts['patterns_matched'])}")
 
     return facts
 
 def generate_decision_map(facts: dict) -> dict:
-    """Generate decision map for Virginia SNAP eligibility"""
+    """Generate decision map for Virginia SNAP eligibility with comprehensive rules"""
 
-    # Virginia SNAP parameters (2026 estimates)
-    SNAP_GROSS_LIMIT_1_PERSON = 1580  # 130% FPL
-    LIHEAP_LIMIT_1_PERSON = 2400      # ~150% FPL
-    STANDARD_UTILITY_ALLOWANCE = 400  # Approximate SUA value
+    # Virginia SNAP gross income limits by household size (2026 estimates, 130% FPL)
+    SNAP_GROSS_LIMITS = {
+        1: 1580,
+        2: 2137,
+        3: 2694,
+        4: 3250,
+        5: 3807,
+        6: 4364,
+        7: 4921,
+        8: 5478
+    }
+
+    # LIHEAP income limits (approximately 150% FPL)
+    LIHEAP_LIMITS = {
+        1: 2400,
+        2: 3240,
+        3: 4080,
+        4: 4920,
+        5: 5760,
+        6: 6600,
+        7: 7440,
+        8: 8280
+    }
+
+    household_size = facts.get("household_size", 1)
+    gross_limit = SNAP_GROSS_LIMITS.get(household_size, SNAP_GROSS_LIMITS[8])
+    liheap_limit = LIHEAP_LIMITS.get(household_size, LIHEAP_LIMITS[8])
 
     decision_map = {
         "program": "SNAP",
@@ -190,59 +369,97 @@ def generate_decision_map(facts: dict) -> dict:
         "high_impact_action": "",
         "next_steps": [],
         "documents_needed": [],
-        "confidence": "medium"
+        "confidence": "medium",
+        "household_size": household_size,
+        "income_limit": gross_limit,
+        "facts_extracted": {
+            "income_sources": facts.get("income_sources", []),
+            "circumstances": facts.get("circumstances", []),
+            "patterns_matched": len(facts.get("patterns_matched", []))
+        }
     }
 
-    gross_income = facts.get("gross_monthly_income")
+    # Get income (support both old and new format)
+    gross_income = facts.get("total_monthly_income") or facts.get("gross_monthly_income")
 
     if gross_income is None:
         decision_map["current_status"] = "insufficient_info"
         decision_map["reason"] = "Unable to determine income from provided information"
+        decision_map["confidence"] = "low"
         decision_map["next_steps"] = [
             "Verify monthly gross income amount",
-            "Gather recent pay stubs or income documentation"
+            "Gather recent pay stubs or income documentation",
+            "List all income sources (employment, benefits, support payments)"
         ]
+        decision_map["missing_info"] = facts.get("missing_critical_info", ["income"])
         return decision_map
 
-    if gross_income <= SNAP_GROSS_LIMIT_1_PERSON:
+    # Elderly/disabled households have no gross income test in some cases
+    if facts.get("elderly_in_household") or facts.get("disabled_in_household"):
+        decision_map["confidence"] = "medium"
+        decision_map["special_rules"] = "Elderly/disabled household - may qualify under net income test only"
+
+    if gross_income <= gross_limit:
         decision_map["current_status"] = "likely_eligible"
-        decision_map["reason"] = "Income is within SNAP gross income limits"
+        decision_map["reason"] = f"Income ${gross_income}/month is within SNAP gross limit of ${gross_limit} for household of {household_size}"
+        decision_map["confidence"] = "high"
         decision_map["next_steps"] = [
-            "Apply for SNAP through local DSS office",
-            "Gather required income and identity documents"
+            "Apply for SNAP through local DSS office or CommonHelp.virginia.gov",
+            "Gather required income and identity documents",
+            "Complete interview within 30 days of application"
         ]
         decision_map["documents_needed"] = [
-            "Recent pay stubs (30 days)",
-            "Photo ID",
-            "Proof of residence"
+            "Recent pay stubs (last 30 days)",
+            "Photo ID for all adult household members",
+            "Proof of residence (lease, utility bill)",
+            "Social Security cards for all household members"
         ]
+
+        # Add expedited service info if applicable
+        if gross_income < 150 or 'homeless' in facts.get("circumstances", []):
+            decision_map["expedited"] = True
+            decision_map["next_steps"].insert(0, "Request EXPEDITED processing (7-day approval)")
     else:
-        # Check for potential deductions via LIHEAP
-        income_over = gross_income - SNAP_GROSS_LIMIT_1_PERSON
+        income_over = gross_income - gross_limit
 
-        if (facts.get("utilities_separate") and
-            gross_income <= LIHEAP_LIMIT_1_PERSON):
-
+        # Check for LIHEAP pathway
+        if facts.get("utilities_separate") and gross_income <= liheap_limit:
+            decision_map["current_status"] = "potentially_eligible"
             decision_map["reversible"] = True
-            decision_map["reason"] = f"Income is ${income_over} over SNAP limit, but LIHEAP utility deduction could qualify household"
-            decision_map["high_impact_action"] = "Apply for LIHEAP to qualify for Standard Utility Allowance, which reduces countable SNAP income"
+            decision_map["reason"] = f"Income ${gross_income}/month is ${income_over} over SNAP limit, but LIHEAP utility deduction could qualify household"
+            decision_map["high_impact_action"] = "Apply for LIHEAP to qualify for Standard Utility Allowance (SUA), which reduces countable SNAP income"
             decision_map["next_steps"] = [
-                "Apply for LIHEAP immediately",
-                "Collect utility bills for LIHEAP application",
-                "Reapply for SNAP once LIHEAP approved or pending",
-                "Reference LIHEAP application when applying for SNAP"
+                "Apply for LIHEAP immediately at local DSS or action agency",
+                "Collect utility bills showing account in your name",
+                "Apply for SNAP and mention pending LIHEAP application",
+                "Request SUA deduction on SNAP application"
             ]
             decision_map["documents_needed"] = [
-                "Recent electric or gas bill",
+                "Recent electric or gas bill in your name",
                 "Proof of income (last 30 days)",
-                "Lease agreement or rent receipt"
+                "Lease agreement showing utilities are separate",
+                "Photo ID and Social Security card"
             ]
+            decision_map["potential_benefit"] = f"With SUA deduction, net income could qualify for SNAP"
         else:
-            decision_map["reason"] = f"Income is ${income_over} over SNAP limit and no available deductions apply"
+            decision_map["current_status"] = "not_eligible"
+            decision_map["reason"] = f"Income ${gross_income}/month exceeds SNAP limit of ${gross_limit} for household of {household_size}"
             decision_map["next_steps"] = [
                 "Verify all income amounts are accurate",
-                "Check if any household circumstances have changed"
+                "Check if household size should include additional members",
+                "Review if any deductions apply (medical, childcare, shelter)"
             ]
+
+            # Check for other deduction opportunities
+            deduction_opportunities = []
+            if facts.get("elderly_in_household") or facts.get("disabled_in_household"):
+                deduction_opportunities.append("Medical expense deduction (expenses over $35/month)")
+            if 'medical_expenses' in facts.get("circumstances", []):
+                deduction_opportunities.append("Medical expense deduction available")
+
+            if deduction_opportunities:
+                decision_map["deduction_opportunities"] = deduction_opportunities
+                decision_map["reversible"] = True
 
     return decision_map
 
