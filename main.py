@@ -34,7 +34,8 @@ class RunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     run_id: str
-    decision_map: dict
+    decision_map: dict  # SNAP-only (backward compatible)
+    multi_program: dict  # All 6 programs
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify Supabase JWT and extract user ID"""
@@ -114,6 +115,92 @@ FREQUENCY_TO_MONTHLY = {
     'monthly': 1.0,
     'annual': 0.0833,      # 1 ÷ 12
     'yearly': 0.0833
+}
+
+# =============================================================================
+# FEDERAL POVERTY LEVEL TABLES (2024 - Virginia)
+# =============================================================================
+# Base 100% FPL monthly amounts by household size
+FPL_100_MONTHLY = {
+    1: 1255, 2: 1704, 3: 2152, 4: 2600,
+    5: 3048, 6: 3496, 7: 3944, 8: 4392
+}
+
+def get_fpl_limit(household_size: int, percentage: int) -> int:
+    """Calculate FPL limit for household size at given percentage."""
+    base = FPL_100_MONTHLY.get(min(household_size, 8), FPL_100_MONTHLY[8])
+    # Add $448/month for each person over 8
+    if household_size > 8:
+        base += (household_size - 8) * 448
+    return int(base * percentage / 100)
+
+# Program configuration with income limits and metadata
+PROGRAM_CONFIG = {
+    'snap': {
+        'name': 'SNAP',
+        'full_name': 'Supplemental Nutrition Assistance Program',
+        'category': 'food',
+        'income_limit_pct': 130,
+        'application_url': 'https://commonhelp.virginia.gov',
+        'unlocks': ['school_lunch']
+    },
+    'medicaid': {
+        'name': 'Medicaid',
+        'full_name': 'Virginia Medicaid',
+        'category': 'health',
+        'income_limit_pct': 138,  # Expansion state
+        'income_limit_pct_children': 143,
+        'income_limit_pct_pregnant': 148,
+        'application_url': 'https://commonhelp.virginia.gov',
+        'unlocks': ['school_lunch']
+    },
+    'liheap': {
+        'name': 'LIHEAP',
+        'full_name': 'Low Income Home Energy Assistance Program',
+        'category': 'utilities',
+        'income_limit_pct': 150,
+        'application_url': 'https://commonhelp.virginia.gov',
+        'unlocks': []
+    },
+    'wic': {
+        'name': 'WIC',
+        'full_name': 'Women, Infants, and Children',
+        'category': 'food',
+        'income_limit_pct': 185,
+        'application_url': 'https://www.vdh.virginia.gov/wic/',
+        'unlocks': []
+    },
+    'school_lunch': {
+        'name': 'School Lunch',
+        'full_name': 'National School Lunch Program',
+        'category': 'food',
+        'income_limit_pct_free': 130,
+        'income_limit_pct_reduced': 185,
+        'application_url': 'https://www.doe.virginia.gov/programs-services/school-operations-support-services/school-nutrition',
+        'unlocks': []
+    },
+    'msp': {
+        'name': 'MSP',
+        'full_name': 'Medicare Savings Programs',
+        'category': 'health',
+        'income_limit_pct_qmb': 100,
+        'income_limit_pct_slmb': 120,
+        'income_limit_pct_qi': 135,
+        'application_url': 'https://commonhelp.virginia.gov',
+        'unlocks': []
+    }
+}
+
+# Estimated monthly benefit ranges by program and household size
+BENEFIT_ESTIMATES = {
+    'snap': {1: (23, 234), 2: (200, 430), 3: (350, 616), 4: (450, 782), 5: (530, 929), 6: (640, 1115)},
+    'medicaid': 'Full health coverage',
+    'liheap': (100, 500),  # Annual benefit, varies by heating type
+    'wic': (50, 100),
+    'school_lunch': (100, 200),  # Per child per month
+    'msp_qmb': (175, 400),
+    'msp_slmb': (150, 200),
+    'msp_qi': (150, 200)
 }
 
 # =============================================================================
@@ -218,6 +305,22 @@ def normalize_facts(input_raw: str) -> dict:
         "elderly_in_household": False,
         "disabled_in_household": False,
 
+        # CHILDREN DETAILS (for WIC, School Lunch)
+        "children_under_5": 0,
+        "children_school_age": 0,  # Ages 5-18
+        "infants_under_1": 0,
+
+        # PREGNANCY/MATERNAL STATUS (for WIC, Medicaid)
+        "pregnant": False,
+        "pregnancy_weeks": None,
+        "postpartum": False,
+        "postpartum_months": None,
+        "breastfeeding": False,
+
+        # MEDICARE STATUS (for MSP)
+        "medicare_eligible": False,
+        "on_medicare": False,
+
         # EMPLOYMENT
         "employment_status": None,
         "work_hours": None,
@@ -228,6 +331,8 @@ def normalize_facts(input_raw: str) -> dict:
         "rent": None,
         "utilities_separate": False,
         "utility_cost": None,
+        "utilities_included": False,
+        "has_heating_cooling_costs": False,
 
         # SPECIAL CIRCUMSTANCES
         "circumstances": [],
@@ -283,6 +388,10 @@ def normalize_facts(input_raw: str) -> dict:
         # Explicit member counting
         (r'grandmother.*daughter.*(?:son|grandson|child)', 'multigenerational'),  # 3+ generations
         (r'(?:father|mother|parent).*(?:children|kids).*(?:ages?\s*\d+)', 'parent_with_children'),
+        # Specific child mentions that add to household
+        (r'(?:has\s*(?:a\s*)?)?(\d+)[-\s]?year[-\s]?old\s*(?:son|daughter|child)', 'specific_child'),
+        (r'(?:has\s*(?:a\s*)?)?(\d+)[-\s]?(?:month|mo)[-\s]?old\s*(?:son|daughter|child|baby)', 'specific_child'),
+        (r'(?:with|has)\s*(?:a\s*)?\s*(?:newborn|infant|baby|toddler)', 'has_infant'),
     ]
 
     # Custody patterns
@@ -320,9 +429,11 @@ def normalize_facts(input_raw: str) -> dict:
                 facts["household_size"] = max(facts["household_size"], num_children + 1)
                 facts["household_members"].append({"type": "children", "count": num_children})
             elif pattern_type == 'children_ages':
-                # "children ages 6 and 10" = 2 children
-                facts["household_size"] = max(facts["household_size"], 3)  # At least parent + 2 children
-                facts["household_members"].append({"type": "children", "count": 2})
+                # "children ages 6 and 10" = 2 children, add to current adults
+                num_ages = len([g for g in match.groups() if g])
+                # Add children to current household (don't reset, build on top)
+                facts["household_size"] = max(facts["household_size"], facts["household_size"] + num_ages)
+                facts["household_members"].append({"type": "children", "count": num_ages})
             elif pattern_type == 'single':
                 # Only set to 1 if we haven't found children
                 if not facts["household_members"]:
@@ -338,6 +449,28 @@ def normalize_facts(input_raw: str) -> dict:
                 child_match = re.search(r'(\d+)\s*(?:children|kids)', input_lower)
                 if child_match:
                     facts["household_size"] = max(facts["household_size"], int(child_match.group(1)) + 1)
+            elif pattern_type == 'specific_child':
+                # "X-year-old daughter" adds 1 to household
+                if match.group(1):
+                    child_age = int(match.group(1))
+                    # Only add if we haven't seen this age yet
+                    if child_age not in facts["ages"]:
+                        facts["household_size"] = max(facts["household_size"], facts["household_size"] + 1)
+                        facts["ages"].append(child_age)
+                        facts["household_members"].append({"type": "child", "age": child_age})
+                        # Track child age category
+                        if child_age < 1:
+                            facts["infants_under_1"] += 1
+                        if child_age < 5:
+                            facts["children_under_5"] += 1
+                        if 5 <= child_age <= 18:
+                            facts["children_school_age"] += 1
+                        print(f"DEBUG - Specific child pattern matched: age {child_age}, added to household")
+            elif pattern_type == 'has_infant':
+                facts["household_size"] = max(facts["household_size"], facts["household_size"] + 1)
+                facts["infants_under_1"] += 1
+                facts["children_under_5"] += 1
+                print(f"DEBUG - Has infant pattern matched: added 1 to household")
 
             conf = calculate_extraction_confidence("household", facts["household_size"], input_raw, pattern)
             facts["extraction_confidence"]["household_size"] = conf["confidence"]
@@ -370,37 +503,18 @@ def normalize_facts(input_raw: str) -> dict:
         return float(amount_str.replace(",", ""))
 
     income_patterns = [
-        # Employment with frequency detection (earns/makes) - supports decimals
-        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),
-        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*week(?:ly)?', 'employment', 'weekly'),
-        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:bi[-\s]?weekly|every\s*(?:two|2)\s*weeks?)', 'employment', 'biweekly'),
-        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
-        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*year', 'employment', 'yearly'),
-        (r'\$([0-9,.]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),  # "$16.50/hour"
-        (r'\$([0-9,.]+)\s*(?:a|per)\s*month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
-        (r'\$([0-9,.]+)\s*(?:a|per)\s*week(?:ly)?', 'employment', 'weekly'),
-        (r'\$([0-9,.]+)\s*monthly', 'employment', 'monthly'),
-        (r'\$([0-9,.]+)\s*weekly', 'employment', 'weekly'),
-        (r'\$([0-9,.]+)\s*(?:before|gross)', 'employment', 'monthly'),
-        (r'salary\s*(?:of\s*)?\$([0-9,.]+)', 'employment', 'yearly'),
-        # Default monthly (must come after specific frequencies)
-        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)(?!\s*(?:a|per|/)\s*(?:hour|week|year))', 'employment', 'monthly'),
-
-        # Self-employment / Gig work / Side business
-        (r'(?:1099|freelance|gig|side\s*(?:hustle|business)|self[-\s]?employ)\s*.*?\$([0-9,.]+)', 'self_employment', 'monthly'),
-        (r'\$([0-9,.]+)\s*(?:from\s*)?(?:side\s*(?:hustle|business)|freelance)', 'self_employment', 'monthly'),
-        (r'(?:uber|lyft|doordash|instacart)\s*.*?\$([0-9,.]+)', 'gig_work', 'monthly'),
-        (r'cleaning\s*(?:offices?|houses?|business).*?\$([0-9,.]+)', 'self_employment', 'monthly'),
-
+        # SPECIFIC BENEFIT TYPES FIRST (before generic patterns)
         # Government benefits (always monthly) - label before and after amount
+        (r'(?:combined\s*)?social\s*security\s*(?:income\s*)?(?:of\s*)?\$([0-9,.]+)', 'social_security', 'monthly'),
+        (r'social\s*security\s*(?:income\s*)?(?:of\s*)?\$([0-9,.]+)', 'social_security', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?social\s*security', 'social_security', 'monthly'),
+        (r'\$([0-9,.]+)/month\s*(?:from\s*)?social\s*security', 'social_security', 'monthly'),
         (r'unemployment\s*(?:benefits?\s*)?(?:of\s*)?\$([0-9,.]+)', 'unemployment', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?unemployment', 'unemployment', 'monthly'),
         (r'expecting\s*(?:about\s*)?\$([0-9,.]+)\s*(?:weekly|per\s*week)', 'unemployment_pending', 'weekly'),
-        (r'social\s*security\s*(?:of\s*)?\$([0-9,.]+)', 'social_security', 'monthly'),
-        (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?social\s*security', 'social_security', 'monthly'),
         (r'(?:ssi|ssdi)\s*(?:of\s*)?\$([0-9,.]+)', 'ssi_ssdi', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?(?:ssi|ssdi)', 'ssi_ssdi', 'monthly'),
-        (r'\$([0-9,.]+)\s*monthly\s*ssdi', 'ssi_ssdi', 'monthly'),  # "$914 monthly SSDI"
+        (r'\$([0-9,.]+)\s*monthly\s*ssdi', 'ssi_ssdi', 'monthly'),
         (r'disability\s*(?:benefits?\s*)?(?:of\s*)?\$([0-9,.]+)', 'disability', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?disability', 'disability', 'monthly'),
         (r'gets?\s*\$([0-9,.]+)\s*(?:monthly\s*)?(?:from\s*)?(?:ssi|ssdi|disability)', 'disability', 'monthly'),
@@ -415,6 +529,31 @@ def normalize_facts(input_raw: str) -> dict:
         (r'\$([0-9,.]+)\s*(?:from\s*)?child\s*support', 'child_support', 'monthly'),
         (r'alimony\s*(?:of\s*)?\$([0-9,.]+)', 'alimony', 'monthly'),
         (r'\$([0-9,.]+)\s*(?:from\s*)?alimony', 'alimony', 'monthly'),
+
+        # Self-employment / Gig work / Side business
+        (r'(?:1099|freelance|gig|side\s*(?:hustle|business)|self[-\s]?employ)\s*.*?\$([0-9,.]+)', 'self_employment', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:from\s*)?(?:side\s*(?:hustle|business)|freelance)', 'self_employment', 'monthly'),
+        (r'(?:uber|lyft|doordash|instacart)\s*.*?\$([0-9,.]+)', 'gig_work', 'monthly'),
+        (r'cleaning\s*(?:offices?|houses?|business).*?\$([0-9,.]+)', 'self_employment', 'monthly'),
+
+        # GENERIC EMPLOYMENT PATTERNS (after specific types)
+        # Employment with frequency detection (earns/makes) - supports decimals
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*week(?:ly)?', 'employment', 'weekly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:bi[-\s]?weekly|every\s*(?:two|2)\s*weeks?)', 'employment', 'biweekly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)/month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)\s*(?:a|per)\s*year', 'employment', 'yearly'),
+        (r'\$([0-9,.]+)\s*(?:a|per|/)\s*hour', 'employment', 'hourly'),  # "$16.50/hour"
+        (r'\$([0-9,.]+)\s*(?:a|per)\s*month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
+        (r'\$([0-9,.]+)/month(?:\s*(?:before|gross))?', 'employment', 'monthly'),
+        (r'\$([0-9,.]+)\s*(?:a|per)\s*week(?:ly)?', 'employment', 'weekly'),
+        (r'\$([0-9,.]+)\s*monthly', 'employment', 'monthly'),
+        (r'\$([0-9,.]+)\s*weekly', 'employment', 'weekly'),
+        (r'\$([0-9,.]+)\s*(?:before|gross)', 'employment', 'monthly'),
+        (r'salary\s*(?:of\s*)?\$([0-9,.]+)', 'employment', 'yearly'),
+        # Default monthly (must come after specific frequencies)
+        (r'(?:makes?|earns?|earning)\s*(?:around\s*)?\$([0-9,.]+)(?!\s*(?:a|per|/)\s*(?:hour|week|year))', 'employment', 'monthly'),
 
         # Non-dollar income patterns
         (r'(?:makes?|earns?)\s*(?:around\s*|about\s*)?([0-9,]+)\s*(?:a|per)\s*month', 'employment', 'monthly'),
@@ -432,6 +571,28 @@ def normalize_facts(input_raw: str) -> dict:
     seen_amounts = {}  # Track amounts with their types for deduplication
     seen_monthly_amounts = set()  # Track normalized monthly amounts to prevent double-counting
 
+    # Pre-pass: detect work hours mentioned (for hourly rate calculation)
+    detected_work_hours = []
+    hours_patterns = [
+        r'(\d+)\s*hours?\s*(?:a|per)\s*week',
+        r'(\d+)\s*hrs?/week',
+        r'(\d+)\s*hours?\s*(?:at|weekly)',
+        r'for\s*(\d+)\s*hours?',
+        r'about\s*(\d+)\s*hours?\s*(?:a|per)?\s*week',
+    ]
+    for hp in hours_patterns:
+        for hm in re.finditer(hp, input_lower):
+            try:
+                hours = int(hm.group(1))
+                if 1 <= hours <= 80:  # Reasonable range
+                    detected_work_hours.append(hours)
+            except ValueError:
+                pass
+    print(f"DEBUG - Detected work hours: {detected_work_hours}")
+
+    # Track which hours have been used (for multi-job scenarios)
+    used_hours_indices = set()
+
     # Process regular income patterns
     for pattern, income_type, frequency in income_patterns:
         patterns_attempted += 1
@@ -444,8 +605,54 @@ def normalize_facts(input_raw: str) -> dict:
                 if amount < 10 and frequency == 'monthly':
                     continue
 
+                # Skip if this looks like rent/utilities/medical (not income)
+                # Use tight context: 20 chars before $ and 25 chars after the match
+                context_before = input_lower[max(0, match.start() - 20):match.start()]
+                context_after = input_lower[match.end():min(len(input_lower), match.end() + 25)]
+                tight_context = context_before + match.group(0) + context_after
+
+                # Check for expense indicators in tight context
+                expense_after = r'(?:for\s*(?:heat|rent|utilities|electric|gas)|contribution|to\s*rent)'
+                expense_before = r'(?:pays?|paying|rents?|utilities?|heat(?:ing)?|medication|medical|costs?|averaging)\s*\$?$'
+
+                is_expense = False
+                if re.search(expense_after, context_after):
+                    is_expense = True
+                if re.search(expense_before, context_before):
+                    is_expense = True
+
+                # Also check if the context contains expense words near the amount
+                expense_context = input_lower[max(0, match.start() - 30):min(len(input_lower), match.end() + 30)]
+                # Check for expense patterns (expense word before or after amount)
+                expense_patterns = [
+                    r'(?:rent|utilities?|heat(?:ing)?|medication|medical\s*costs?|electric|gas)\s*(?:of\s*|is\s*|averaging\s*|about\s*|around\s*)?\$',
+                    r'\$[0-9,.]+\s*/?\s*month\s*(?:for\s*)?(?:rent|utilities?|heat(?:ing)?|medication|medical)',  # "$X/month medication"
+                    r'rents?\s*(?:a\s*)?(?:room|apartment|house)?\s*(?:for\s*)?\$',  # "Rents a room for $X"
+                ]
+                for exp_pattern in expense_patterns:
+                    if re.search(exp_pattern, expense_context):
+                        if not re.search(r'(?:income|earns?|makes?|salary|wages?)', expense_context):
+                            is_expense = True
+                            break
+
+                if is_expense:
+                    print(f"DEBUG - Skipping ${amount} - appears to be expense (context: '{tight_context[:60]}...')")
+                    continue
+
                 # Calculate monthly for deduplication check
-                multiplier = FREQUENCY_TO_MONTHLY.get(frequency, 1.0)
+                # For hourly rates, use detected hours if available
+                if frequency == 'hourly' and detected_work_hours:
+                    # Find next available hours count
+                    for i, hours in enumerate(detected_work_hours):
+                        if i not in used_hours_indices:
+                            multiplier = hours * 4.33  # hours/week × weeks/month
+                            used_hours_indices.add(i)
+                            print(f"DEBUG - Using detected hours {hours} for hourly rate ${amount}")
+                            break
+                    else:
+                        multiplier = FREQUENCY_TO_MONTHLY.get(frequency, 1.0)
+                else:
+                    multiplier = FREQUENCY_TO_MONTHLY.get(frequency, 1.0)
                 monthly_check = int(amount * multiplier)
 
                 # Skip if we've seen this exact raw amount with this type
@@ -466,9 +673,8 @@ def normalize_facts(input_raw: str) -> dict:
                 seen_amounts[amount_key] = monthly_check
                 seen_monthly_amounts.add(monthly_check)
 
-                # Normalize to monthly
-                multiplier = FREQUENCY_TO_MONTHLY.get(frequency, 1.0)
-                monthly_amount = int(amount * multiplier)
+                # Use same multiplier (already calculated above) for actual storage
+                monthly_amount = monthly_check
 
                 income_source = {
                     "type": income_type,
@@ -569,45 +775,163 @@ def normalize_facts(input_raw: str) -> dict:
             break
 
     # =========================================================================
-    # 3. AGE PATTERNS (Enhanced - find ALL ages)
+    # 3. AGE PATTERNS (Enhanced - find ALL ages + categorize children)
     # =========================================================================
     age_patterns = [
         (r'(\d+)\s*years?\s*old', 'age'),
         (r'age[sd]?\s*(\d+)', 'age'),
         (r'(?:kids?|children?)\s*(?:are\s*)?(\d+)(?:\s*,\s*(\d+))?(?:\s*(?:,|and)\s*(\d+))?', 'child_ages'),
+        (r'(?:kids?|children?)\s*ages?\s*(\d+)\s*and\s*(\d+)', 'child_ages_named'),  # "children ages 3 and 6"
         (r'elderly|senior', 'elderly'),
         (r'retired', 'retired'),
+        # Child-specific patterns
+        (r'(\d+)[-\s]?(?:year|yr)[-\s]?old\s*(?:child|kid|son|daughter|boy|girl)', 'child_age'),
+        (r'(?:baby|infant)\s*(?:is\s*)?(\d+)\s*(?:months?|mo)', 'infant_months'),
+        (r'newborn|new\s*baby', 'newborn'),
+        (r'toddler', 'toddler'),
+        (r'(?:in\s*)?(?:kindergarten|elementary|middle|high)\s*school', 'school_age'),
     ]
 
     for pattern, pattern_type in age_patterns:
         patterns_attempted += 1
-        if pattern_type == 'child_ages':
+        if pattern_type in ['child_ages', 'child_ages_named']:
             match = re.search(pattern, input_lower)
             if match:
                 for group in match.groups():
                     if group:
                         try:
                             age = int(group)
-                            if age < 22:  # Reasonable child age
+                            if age < 22 and age not in facts["ages"]:
                                 facts["ages"].append(age)
+                                # Categorize children
+                                if age < 1:
+                                    facts["infants_under_1"] += 1
+                                if age < 5:
+                                    facts["children_under_5"] += 1
+                                if 5 <= age <= 18:
+                                    facts["children_school_age"] += 1
+                                print(f"DEBUG - Child age pattern ({pattern_type}): age {age}, school_age={5 <= age <= 18}")
                         except ValueError:
                             pass
         elif pattern_type == 'age':
             for match in re.finditer(pattern, input_lower):
                 try:
                     age = int(match.group(1))
-                    if age not in facts["ages"]:  # Avoid duplicates
+                    if age not in facts["ages"]:
                         facts["ages"].append(age)
                         if age >= 60:
                             facts["elderly_in_household"] = True
+                        if age >= 65:
+                            facts["medicare_eligible"] = True
+                        # Categorize children
+                        if age < 1:
+                            facts["infants_under_1"] += 1
+                        if age < 5:
+                            facts["children_under_5"] += 1
+                        if 5 <= age <= 18:
+                            facts["children_school_age"] += 1
                         facts["patterns_matched"].append(f"age:{age}")
                         print(f"DEBUG - Age matched: {age}")
                 except ValueError:
                     pass
+        elif pattern_type == 'child_age':
+            for match in re.finditer(pattern, input_lower):
+                try:
+                    age = int(match.group(1))
+                    if age not in facts["ages"]:
+                        facts["ages"].append(age)
+                        if age < 1:
+                            facts["infants_under_1"] += 1
+                        if age < 5:
+                            facts["children_under_5"] += 1
+                        if 5 <= age <= 18:
+                            facts["children_school_age"] += 1
+                except ValueError:
+                    pass
+        elif pattern_type == 'infant_months':
+            match = re.search(pattern, input_lower)
+            if match:
+                facts["infants_under_1"] += 1
+                facts["children_under_5"] += 1
+        elif pattern_type == 'newborn':
+            if re.search(pattern, input_lower):
+                facts["infants_under_1"] += 1
+                facts["children_under_5"] += 1
+        elif pattern_type == 'toddler':
+            if re.search(pattern, input_lower):
+                # Only add if we haven't already counted a toddler-age child (1-3)
+                has_toddler_age = any(1 <= a <= 3 for a in facts["ages"])
+                if not has_toddler_age:
+                    facts["children_under_5"] += 1
+                    print("DEBUG - Toddler pattern matched: added to children_under_5")
+        elif pattern_type == 'school_age':
+            if re.search(pattern, input_lower):
+                facts["children_school_age"] = max(facts["children_school_age"], 1)
         elif pattern_type in ['elderly', 'retired']:
             if re.search(pattern, input_lower):
                 facts["elderly_in_household"] = True
+                facts["medicare_eligible"] = True
                 facts["patterns_matched"].append(f"age:{pattern_type}")
+
+    # =========================================================================
+    # 3b. PREGNANCY/MATERNAL STATUS PATTERNS (for WIC, Medicaid)
+    # =========================================================================
+    pregnancy_patterns = [
+        (r'pregnant|expecting(?:\s*a\s*baby)?', 'pregnant'),
+        (r'(\d+)\s*weeks?\s*pregnant', 'pregnancy_weeks'),
+        (r'due\s*(?:date|in)', 'pregnant'),
+        (r'postpartum|gave\s*birth|new\s*baby|just\s*had\s*(?:a\s*)?baby', 'postpartum'),
+        (r'(\d+)\s*(?:months?|mo)\s*postpartum', 'postpartum_months'),
+        (r'breastfeeding|nursing|currently\s*breastfeeding', 'breastfeeding'),
+    ]
+
+    for pattern, pattern_type in pregnancy_patterns:
+        patterns_attempted += 1
+        match = re.search(pattern, input_lower)
+        if match:
+            if pattern_type == 'pregnant':
+                facts["pregnant"] = True
+                facts["patterns_matched"].append("pregnancy:pregnant")
+                print("DEBUG - Pregnancy detected")
+            elif pattern_type == 'pregnancy_weeks':
+                facts["pregnant"] = True
+                facts["pregnancy_weeks"] = int(match.group(1))
+                facts["patterns_matched"].append(f"pregnancy:{match.group(1)}_weeks")
+            elif pattern_type == 'postpartum':
+                facts["postpartum"] = True
+                facts["patterns_matched"].append("pregnancy:postpartum")
+            elif pattern_type == 'postpartum_months':
+                facts["postpartum"] = True
+                facts["postpartum_months"] = int(match.group(1))
+            elif pattern_type == 'breastfeeding':
+                facts["breastfeeding"] = True
+                facts["patterns_matched"].append("pregnancy:breastfeeding")
+                print("DEBUG - Breastfeeding detected")
+
+    # =========================================================================
+    # 3c. MEDICARE STATUS PATTERNS (for MSP)
+    # =========================================================================
+    medicare_patterns = [
+        (r'on\s*medicare|medicare\s*(?:recipient|card|eligible|enrolled)', 'on_medicare'),
+        (r'both\s*on\s*medicare', 'on_medicare'),
+        (r'turned\s*65|over\s*65|age\s*65\+?', 'medicare_eligible'),
+        (r'ssdi|disability\s*(?:for\s*)?\d+\s*years?', 'disability_medicare'),
+    ]
+
+    for pattern, pattern_type in medicare_patterns:
+        patterns_attempted += 1
+        if re.search(pattern, input_lower):
+            if pattern_type == 'on_medicare':
+                facts["on_medicare"] = True
+                facts["medicare_eligible"] = True
+                facts["patterns_matched"].append("medicare:enrolled")
+                print("DEBUG - Medicare enrolled detected")
+            elif pattern_type == 'medicare_eligible':
+                facts["medicare_eligible"] = True
+                facts["patterns_matched"].append("medicare:eligible")
+            elif pattern_type == 'disability_medicare':
+                facts["medicare_eligible"] = True
+                facts["disabled_in_household"] = True
 
     # =========================================================================
     # 4. HOUSING PATTERNS (Enhanced with instability detection)
@@ -662,14 +986,22 @@ def normalize_facts(input_raw: str) -> dict:
                 facts["circumstances"].append("homeless")
 
     # =========================================================================
-    # 5. UTILITY PATTERNS
+    # 5. UTILITY PATTERNS (Enhanced for LIHEAP eligibility)
     # =========================================================================
     utility_patterns = [
-        (r'(?:utilities?|electric|gas|heat)\s*(?:is\s*|of\s*|about\s*)?\$([0-9,]+)', 'utility_amount'),
-        (r'\$([0-9,]+)\s*(?:for\s*)?(?:utilities?|electric|gas)', 'utility_amount'),
+        (r'(?:utilities?|electric|gas|heat(?:ing)?)\s*(?:is\s*|of\s*|about\s*|averaging\s*)?\$([0-9,]+)', 'utility_amount'),
+        (r'\$([0-9,]+)\s*(?:for\s*|in\s*)?(?:utilities?|electric|gas|heat)', 'utility_amount'),
         (r'\$([0-9,]+)\s*total\s*(?:utilities?|electric\s*and\s*gas)', 'utility_amount'),
-        (r'pays?\s*(?:electric|gas|utilities?)\s*separate(?:ly)?', 'separate'),
+        (r'pays?\s*(?:for\s*)?(?:electric|gas|utilities?|heat(?:ing)?)\s*separate(?:ly)?', 'separate'),
+        (r'(?:electric|gas|utilities?)\s*(?:bills?\s*)?separate(?:ly)?', 'separate'),
         (r'utilities?\s*(?:are\s*)?included', 'included'),
+        (r'(?:rent|landlord)\s*(?:covers?|includes?|pays?)\s*(?:all\s*)?(?:utilities?|heat)', 'included'),
+        (r'no\s*(?:current\s*)?utility\s*bills?', 'no_bills'),
+        # Heating/cooling specific for LIHEAP
+        (r'(?:heating|cooling|propane|oil|furnace)\s*(?:bill|cost|expense)', 'heating_cost'),
+        (r'(?:air\s*condition(?:ing)?|ac)\s*(?:bill|cost)', 'cooling_cost'),
+        (r'\$([0-9,]+)\s*(?:(?:a|per|/)\s*)?month\s*(?:for\s*)?(?:heating|heat|electric|gas)', 'utility_amount'),
+        (r'pay\s*\$([0-9,]+)\s*(?:(?:a|per|/)\s*)?month\s*(?:for\s*)?(?:heating|oil|electric|gas)', 'utility_amount'),
     ]
 
     for pattern, pattern_type in utility_patterns:
@@ -679,11 +1011,19 @@ def normalize_facts(input_raw: str) -> dict:
             if pattern_type == 'utility_amount':
                 facts["utility_cost"] = int(match.group(1).replace(",", ""))
                 facts["utilities_separate"] = True
+                facts["has_heating_cooling_costs"] = True
                 print(f"DEBUG - Utility cost matched: ${facts['utility_cost']}")
             elif pattern_type == 'separate':
                 facts["utilities_separate"] = True
+                facts["has_heating_cooling_costs"] = True
             elif pattern_type == 'included':
                 facts["utilities_separate"] = False
+                facts["utilities_included"] = True
+            elif pattern_type == 'no_bills':
+                facts["utilities_separate"] = False
+            elif pattern_type in ['heating_cost', 'cooling_cost']:
+                facts["has_heating_cooling_costs"] = True
+                facts["utilities_separate"] = True
             facts["patterns_matched"].append(f"utility:{pattern_type}")
 
     # =========================================================================
@@ -818,7 +1158,486 @@ def normalize_facts(input_raw: str) -> dict:
     return facts
 
 # =============================================================================
-# DECISION MAP GENERATION (Enhanced with soft validation)
+# MULTI-PROGRAM ELIGIBILITY FUNCTIONS
+# =============================================================================
+
+def check_snap_eligibility(facts: dict) -> dict:
+    """Check SNAP eligibility."""
+    household_size = facts.get("household_size", 1)
+    gross_income = facts.get("total_monthly_income")
+    income_limit = get_fpl_limit(household_size, 130)
+
+    result = {
+        "program": "SNAP",
+        "program_full_name": "Supplemental Nutrition Assistance Program",
+        "status": "not_eligible",
+        "confidence": "medium",
+        "reason": "",
+        "income_limit": income_limit,
+        "estimated_benefit": None,
+        "next_steps": [],
+        "documents_needed": [],
+        "application_url": PROGRAM_CONFIG['snap']['application_url'],
+        "unlocks": ["Free School Lunch"]
+    }
+
+    if gross_income is None:
+        result["status"] = "insufficient_info"
+        result["reason"] = "Income information needed"
+        result["confidence"] = "low"
+        return result
+
+    # Get benefit estimate
+    benefit_range = BENEFIT_ESTIMATES['snap'].get(min(household_size, 6), (400, 800))
+    result["estimated_benefit"] = f"${benefit_range[0]}-{benefit_range[1]}/month"
+
+    if gross_income <= income_limit:
+        result["status"] = "likely_eligible"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month within limit of ${income_limit} for household of {household_size}"
+        result["next_steps"] = [
+            "Apply at CommonHelp.virginia.gov or local DSS office",
+            "Gather required income and identity documents",
+            "Complete interview within 30 days"
+        ]
+        result["documents_needed"] = [
+            "Photo ID for all adults",
+            "Proof of income (last 30 days)",
+            "Proof of residence",
+            "Social Security cards"
+        ]
+
+        # Check for expedited service
+        if gross_income < 150 or facts.get("housing_instability") in ['literal_homeless', 'shelter']:
+            result["expedited"] = True
+            result["next_steps"].insert(0, "Request EXPEDITED processing (7-day approval)")
+    else:
+        result["reason"] = f"Income ${gross_income}/month exceeds limit of ${income_limit}"
+
+        # Check LIHEAP pathway
+        if facts.get("utilities_separate") and not facts.get("utilities_included"):
+            liheap_limit = get_fpl_limit(household_size, 150)
+            if gross_income <= liheap_limit:
+                result["status"] = "potentially_eligible"
+                result["reason"] += ". LIHEAP utility deduction could help qualify."
+                result["next_steps"] = ["Apply for LIHEAP first to get Standard Utility Allowance"]
+
+    return result
+
+
+def check_medicaid_eligibility(facts: dict) -> dict:
+    """Check Medicaid eligibility (Virginia expansion state)."""
+    household_size = facts.get("household_size", 1)
+    gross_income = facts.get("total_monthly_income")
+
+    # Determine appropriate limit
+    if facts.get("pregnant"):
+        limit_pct = 148
+        population = "pregnant"
+    elif facts.get("children_under_5", 0) > 0 or facts.get("children_school_age", 0) > 0:
+        limit_pct = 143
+        population = "children"
+    else:
+        limit_pct = 138
+        population = "adult"
+
+    income_limit = get_fpl_limit(household_size, limit_pct)
+
+    result = {
+        "program": "Medicaid",
+        "program_full_name": "Virginia Medicaid",
+        "status": "not_eligible",
+        "confidence": "medium",
+        "reason": "",
+        "income_limit": income_limit,
+        "estimated_benefit": "Full health coverage",
+        "next_steps": [],
+        "documents_needed": [],
+        "application_url": PROGRAM_CONFIG['medicaid']['application_url'],
+        "unlocks": ["Free School Lunch"]
+    }
+
+    if gross_income is None:
+        result["status"] = "insufficient_info"
+        result["reason"] = "Income information needed"
+        result["confidence"] = "low"
+        return result
+
+    if gross_income <= income_limit:
+        result["status"] = "likely_eligible"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month within {limit_pct}% FPL limit of ${income_limit}"
+        if population == "pregnant":
+            result["reason"] += " (pregnancy coverage)"
+        result["next_steps"] = [
+            "Apply at CommonHelp.virginia.gov or Cover Virginia",
+            "Provide proof of income and identity"
+        ]
+        result["documents_needed"] = [
+            "Photo ID",
+            "Proof of income",
+            "Proof of Virginia residency"
+        ]
+        if facts.get("pregnant"):
+            result["documents_needed"].append("Pregnancy verification from healthcare provider")
+    else:
+        result["reason"] = f"Income ${gross_income}/month exceeds {limit_pct}% FPL limit of ${income_limit}"
+
+    return result
+
+
+def check_liheap_eligibility(facts: dict) -> dict:
+    """Check LIHEAP eligibility."""
+    household_size = facts.get("household_size", 1)
+    gross_income = facts.get("total_monthly_income")
+    income_limit = get_fpl_limit(household_size, 150)
+
+    result = {
+        "program": "LIHEAP",
+        "program_full_name": "Low Income Home Energy Assistance Program",
+        "status": "not_eligible",
+        "confidence": "medium",
+        "reason": "",
+        "income_limit": income_limit,
+        "estimated_benefit": "$100-500/year (varies by heating type)",
+        "next_steps": [],
+        "documents_needed": [],
+        "application_url": PROGRAM_CONFIG['liheap']['application_url'],
+        "unlocks": []
+    }
+
+    if gross_income is None:
+        result["status"] = "insufficient_info"
+        result["reason"] = "Income information needed"
+        result["confidence"] = "low"
+        return result
+
+    # Check if they have heating/cooling costs
+    has_utility_costs = facts.get("has_heating_cooling_costs") or facts.get("utilities_separate")
+    utilities_included = facts.get("utilities_included", False)
+
+    if gross_income <= income_limit:
+        if has_utility_costs and not utilities_included:
+            result["status"] = "likely_eligible"
+            result["confidence"] = "high"
+            result["reason"] = f"Income ${gross_income}/month within 150% FPL limit with separate utility costs"
+            result["next_steps"] = [
+                "Apply at local DSS or Community Action Agency",
+                "Apply during open enrollment (typically Oct-Mar)"
+            ]
+            result["documents_needed"] = [
+                "Recent utility bill in your name",
+                "Proof of income",
+                "Photo ID",
+                "Lease showing utilities are tenant responsibility"
+            ]
+        elif utilities_included:
+            result["status"] = "potentially_eligible"
+            result["confidence"] = "low"
+            result["reason"] = "Income qualifies but utilities are included in rent. May need landlord verification."
+            result["next_steps"] = ["Contact local agency - may qualify with landlord statement"]
+        else:
+            result["status"] = "potentially_eligible"
+            result["reason"] = "Income qualifies. Verify you have heating/cooling costs."
+    else:
+        result["reason"] = f"Income ${gross_income}/month exceeds 150% FPL limit of ${income_limit}"
+
+    return result
+
+
+def check_wic_eligibility(facts: dict) -> dict:
+    """Check WIC eligibility."""
+    household_size = facts.get("household_size", 1)
+    gross_income = facts.get("total_monthly_income")
+    income_limit = get_fpl_limit(household_size, 185)
+
+    result = {
+        "program": "WIC",
+        "program_full_name": "Women, Infants, and Children",
+        "status": "not_applicable",
+        "confidence": "high",
+        "reason": "",
+        "income_limit": income_limit,
+        "estimated_benefit": "$50-100/month in food benefits",
+        "next_steps": [],
+        "documents_needed": [],
+        "application_url": PROGRAM_CONFIG['wic']['application_url'],
+        "unlocks": []
+    }
+
+    # Check if anyone qualifies categorically
+    has_eligible_member = (
+        facts.get("pregnant") or
+        facts.get("postpartum") or
+        facts.get("breastfeeding") or
+        facts.get("children_under_5", 0) > 0 or
+        facts.get("infants_under_1", 0) > 0
+    )
+
+    if not has_eligible_member:
+        result["reason"] = "No eligible members (requires pregnant/postpartum women or children under 5)"
+        return result
+
+    if gross_income is None:
+        result["status"] = "insufficient_info"
+        result["reason"] = "Income information needed"
+        result["confidence"] = "low"
+        return result
+
+    eligible_members = []
+    if facts.get("pregnant"):
+        eligible_members.append("pregnant woman")
+    if facts.get("postpartum"):
+        eligible_members.append("postpartum woman")
+    if facts.get("breastfeeding"):
+        eligible_members.append("breastfeeding woman")
+    if facts.get("infants_under_1", 0) > 0:
+        eligible_members.append(f"{facts['infants_under_1']} infant(s)")
+    if facts.get("children_under_5", 0) > 0:
+        eligible_members.append(f"children under 5")
+
+    if gross_income <= income_limit:
+        result["status"] = "likely_eligible"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month within 185% FPL. Eligible members: {', '.join(eligible_members)}"
+        result["next_steps"] = [
+            "Schedule appointment at local WIC clinic",
+            "Bring eligible family members to appointment"
+        ]
+        result["documents_needed"] = [
+            "Proof of income",
+            "ID for parent/guardian",
+            "Proof of address",
+            "Child's birth certificate or immunization records"
+        ]
+    else:
+        # Check adjunctive eligibility (SNAP/Medicaid = automatic WIC income eligibility)
+        result["status"] = "potentially_eligible"
+        result["reason"] = f"Income over 185% FPL, but may auto-qualify if receiving SNAP or Medicaid"
+
+    return result
+
+
+def check_school_lunch_eligibility(facts: dict) -> dict:
+    """Check Free/Reduced School Lunch eligibility."""
+    household_size = facts.get("household_size", 1)
+    gross_income = facts.get("total_monthly_income")
+    free_limit = get_fpl_limit(household_size, 130)
+    reduced_limit = get_fpl_limit(household_size, 185)
+
+    result = {
+        "program": "School Lunch",
+        "program_full_name": "National School Lunch Program",
+        "status": "not_applicable",
+        "confidence": "high",
+        "reason": "",
+        "income_limit_free": free_limit,
+        "income_limit_reduced": reduced_limit,
+        "estimated_benefit": "$100-200/month per child",
+        "next_steps": [],
+        "documents_needed": [],
+        "application_url": PROGRAM_CONFIG['school_lunch']['application_url'],
+        "unlocks": []
+    }
+
+    # Check if school-age children
+    has_school_children = facts.get("children_school_age", 0) > 0
+
+    if not has_school_children:
+        # Check ages for school-age (5-18)
+        school_age_count = sum(1 for age in facts.get("ages", []) if 5 <= age <= 18)
+        if school_age_count == 0:
+            result["reason"] = "No school-age children (ages 5-18) in household"
+            return result
+        facts["children_school_age"] = school_age_count
+
+    num_children = facts.get("children_school_age", 1)
+    result["estimated_benefit"] = f"${100*num_children}-{200*num_children}/month"
+
+    if gross_income is None:
+        result["status"] = "insufficient_info"
+        result["reason"] = "Income information needed"
+        result["confidence"] = "low"
+        return result
+
+    if gross_income <= free_limit:
+        result["status"] = "likely_eligible"
+        result["tier"] = "free"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month qualifies for FREE meals (under 130% FPL)"
+        result["next_steps"] = [
+            "Complete application through child's school",
+            "If receiving SNAP/Medicaid, you may be auto-enrolled"
+        ]
+    elif gross_income <= reduced_limit:
+        result["status"] = "likely_eligible"
+        result["tier"] = "reduced"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month qualifies for REDUCED PRICE meals (under 185% FPL)"
+        result["next_steps"] = ["Complete application through child's school"]
+    else:
+        result["status"] = "not_eligible"
+        result["reason"] = f"Income ${gross_income}/month exceeds 185% FPL limit of ${reduced_limit}"
+
+    return result
+
+
+def check_msp_eligibility(facts: dict) -> dict:
+    """Check Medicare Savings Programs eligibility."""
+    household_size = facts.get("household_size", 1)
+    gross_income = facts.get("total_monthly_income")
+
+    qmb_limit = get_fpl_limit(household_size, 100)
+    slmb_limit = get_fpl_limit(household_size, 120)
+    qi_limit = get_fpl_limit(household_size, 135)
+
+    result = {
+        "program": "MSP",
+        "program_full_name": "Medicare Savings Programs",
+        "status": "not_applicable",
+        "confidence": "high",
+        "reason": "",
+        "income_limits": {"QMB": qmb_limit, "SLMB": slmb_limit, "QI": qi_limit},
+        "estimated_benefit": None,
+        "next_steps": [],
+        "documents_needed": [],
+        "application_url": PROGRAM_CONFIG['msp']['application_url'],
+        "unlocks": []
+    }
+
+    # Must be Medicare eligible
+    if not facts.get("medicare_eligible") and not facts.get("on_medicare"):
+        result["reason"] = "Not Medicare eligible (must be 65+ or on disability)"
+        return result
+
+    if gross_income is None:
+        result["status"] = "insufficient_info"
+        result["reason"] = "Income information needed"
+        result["confidence"] = "low"
+        return result
+
+    if gross_income <= qmb_limit:
+        result["status"] = "likely_eligible"
+        result["tier"] = "QMB"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month qualifies for QMB (Qualified Medicare Beneficiary)"
+        result["estimated_benefit"] = "Pays Part A & B premiums, deductibles, copays ($175-400+/month value)"
+        result["next_steps"] = ["Apply at local DSS or CommonHelp.virginia.gov"]
+    elif gross_income <= slmb_limit:
+        result["status"] = "likely_eligible"
+        result["tier"] = "SLMB"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month qualifies for SLMB (Specified Low-Income Medicare Beneficiary)"
+        result["estimated_benefit"] = "Pays Part B premium (~$175/month)"
+        result["next_steps"] = ["Apply at local DSS or CommonHelp.virginia.gov"]
+    elif gross_income <= qi_limit:
+        result["status"] = "likely_eligible"
+        result["tier"] = "QI"
+        result["confidence"] = "high"
+        result["reason"] = f"Income ${gross_income}/month qualifies for QI (Qualifying Individual)"
+        result["estimated_benefit"] = "Pays Part B premium (~$175/month)"
+        result["next_steps"] = ["Apply at local DSS - funding is first-come, first-served"]
+    else:
+        result["status"] = "not_eligible"
+        result["reason"] = f"Income ${gross_income}/month exceeds QI limit of ${qi_limit}"
+
+    return result
+
+
+def generate_multi_program_eligibility(facts: dict) -> dict:
+    """Generate eligibility results for all 6 programs."""
+
+    # Check each program
+    snap = check_snap_eligibility(facts)
+    medicaid = check_medicaid_eligibility(facts)
+    liheap = check_liheap_eligibility(facts)
+    wic = check_wic_eligibility(facts)
+    school_lunch = check_school_lunch_eligibility(facts)
+    msp = check_msp_eligibility(facts)
+
+    programs = [snap, medicaid, liheap, wic, school_lunch, msp]
+
+    # Categorize results
+    likely_eligible = [p["program"] for p in programs if p["status"] == "likely_eligible"]
+    potentially_eligible = [p["program"] for p in programs if p["status"] == "potentially_eligible"]
+    not_eligible = [p["program"] for p in programs if p["status"] == "not_eligible"]
+    not_applicable = [p["program"] for p in programs if p["status"] == "not_applicable"]
+    insufficient_info = [p["program"] for p in programs if p["status"] == "insufficient_info"]
+
+    # Determine priority action
+    priority_action = None
+    if snap["status"] == "likely_eligible":
+        priority_action = {
+            "program": "SNAP",
+            "reason": "Apply first - unlocks automatic eligibility for Free School Lunch",
+            "expedited": snap.get("expedited", False)
+        }
+    elif medicaid["status"] == "likely_eligible":
+        priority_action = {
+            "program": "Medicaid",
+            "reason": "Apply first - provides health coverage and unlocks School Lunch",
+            "expedited": False
+        }
+    elif liheap["status"] == "likely_eligible":
+        priority_action = {
+            "program": "LIHEAP",
+            "reason": "Apply to reduce utility costs and potentially help SNAP eligibility",
+            "expedited": False
+        }
+
+    # Calculate total estimated monthly value
+    total_low = 0
+    total_high = 0
+    for p in programs:
+        if p["status"] == "likely_eligible" and p.get("estimated_benefit"):
+            benefit = p["estimated_benefit"]
+            if isinstance(benefit, str) and "$" in benefit:
+                # Parse benefit string like "$100-200/month"
+                import re
+                numbers = re.findall(r'\d+', benefit)
+                if len(numbers) >= 2:
+                    total_low += int(numbers[0])
+                    total_high += int(numbers[1])
+                elif len(numbers) == 1:
+                    total_low += int(numbers[0])
+                    total_high += int(numbers[0])
+
+    total_value = f"${total_low}-{total_high}/month" if total_low > 0 else "Varies"
+
+    # Build response
+    result = {
+        "summary": {
+            "likely_eligible": likely_eligible,
+            "potentially_eligible": potentially_eligible,
+            "not_eligible": not_eligible,
+            "not_applicable": not_applicable,
+            "insufficient_info": insufficient_info
+        },
+        "priority_action": priority_action,
+        "total_estimated_monthly_value": total_value,
+        "programs": programs,
+        "facts_extracted": {
+            "household_size": facts.get("household_size"),
+            "total_monthly_income": facts.get("total_monthly_income"),
+            "income_sources": facts.get("income_sources", []),
+            "children_under_5": facts.get("children_under_5", 0),
+            "children_school_age": facts.get("children_school_age", 0),
+            "pregnant": facts.get("pregnant", False),
+            "breastfeeding": facts.get("breastfeeding", False),
+            "medicare_eligible": facts.get("medicare_eligible", False),
+            "on_medicare": facts.get("on_medicare", False),
+            "has_heating_cooling_costs": facts.get("has_heating_cooling_costs", False),
+            "utilities_included": facts.get("utilities_included", False),
+            "circumstances": facts.get("circumstances", [])
+        },
+        "data_quality_score": facts.get("extraction_debug", {}).get("data_quality_score", 0.5)
+    }
+
+    return result
+
+
+# =============================================================================
+# DECISION MAP GENERATION (SNAP-only, backward compatible)
 # =============================================================================
 def generate_decision_map(facts: dict) -> dict:
     """Generate decision map with comprehensive rules and soft validation."""
@@ -1015,8 +1834,11 @@ async def create_run(
     # Normalize input facts
     facts = normalize_facts(request.input_raw)
 
-    # Generate decision map
+    # Generate decision map (SNAP-only, backward compatible)
     decision_map = generate_decision_map(facts)
+
+    # Generate multi-program eligibility (all 6 programs)
+    multi_program = generate_multi_program_eligibility(facts)
 
     # Store run in database
     run_id = str(uuid.uuid4())
@@ -1034,7 +1856,8 @@ async def create_run(
             "created_by": user_id,
             "input_raw": request.input_raw,
             "facts_normalized": facts,
-            "decision_map": decision_map
+            "decision_map": decision_map,
+            "multi_program": multi_program
         }
 
         response = await client.post(
@@ -1049,7 +1872,7 @@ async def create_run(
                 detail="Failed to store run"
             )
 
-    return RunResponse(run_id=run_id, decision_map=decision_map)
+    return RunResponse(run_id=run_id, decision_map=decision_map, multi_program=multi_program)
 
 @app.get("/orgs/{org_id}/runs")
 async def get_org_runs(
